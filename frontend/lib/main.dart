@@ -1,12 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:camera/camera.dart'; 
 import 'providers/settings_provider.dart';
 import 'screens/settings_screen.dart';
 import 'screens/dashboard_screen.dart';
 import 'screens/profile_screen.dart';
 import 'screens/auth_screen.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
   runApp(
     ChangeNotifierProvider(
       create: (_) => SettingsProvider(),
@@ -37,10 +40,11 @@ class MyApp extends StatelessWidget {
 
           initialRoute: '/',
           routes: {
-            '/': (context) => const AuthScreen(),
+            '/': (context) => const AuthScreen(), 
             '/dashboard': (context) => const DashboardScreen(),
             '/settings': (context) => const SettingsScreen(),
             '/profile': (context) => const ProfileScreen(),
+            '/auth': (context) => const AuthScreen(),
           },
         );
       },

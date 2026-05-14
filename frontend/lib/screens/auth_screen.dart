@@ -21,6 +21,14 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController = TextEditingController();
 
+   @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
   void _handleSubmit() {
     if (_formKey.currentState!.validate()) {
       Navigator.pushReplacementNamed(context, '/dashboard');

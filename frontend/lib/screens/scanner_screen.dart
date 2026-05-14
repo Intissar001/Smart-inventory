@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'dart:math';
+import 'package:camera/camera.dart';
 
 // Data M
 class DetectedBox {
@@ -34,6 +35,9 @@ class CameraScanScreen extends StatefulWidget {
 }
 
 class _CameraScanScreenState extends State<CameraScanScreen> with TickerProviderStateMixin {
+  CameraController? _controller;
+  Future<void>? _initializeControllerFuture;
+
   List<DetectedBox> _detectedBoxes = [];
   bool _isScanning = false;
   bool _flashEnabled = false;
@@ -56,7 +60,26 @@ class _CameraScanScreenState extends State<CameraScanScreen> with TickerProvider
       vsync: this,
     )..repeat(reverse: true);
 
+    _initCamera();
     _startScanning();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) return;
+
+      _controller = CameraController(
+        cameras[0],
+        ResolutionPreset.high,
+        enableAudio: false,
+      );
+
+      _initializeControllerFuture = _controller!.initialize();
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint("Camera Error: $e");
+    }
   }
 
   @override
@@ -65,6 +88,7 @@ class _CameraScanScreenState extends State<CameraScanScreen> with TickerProvider
       timer.cancel();
     }
     _pulseController.dispose();
+    _controller?.dispose();
     super.dispose();
   }
 
@@ -128,12 +152,17 @@ class _CameraScanScreenState extends State<CameraScanScreen> with TickerProvider
 
   void _handleCapture() async {
     if (!_isScanning) return;
+
+    if (_controller != null && _controller!.value.isInitialized) {
+      await _controller!.setFlashMode(_flashEnabled ? FlashMode.torch : FlashMode.off);
+    }
+
     setState(() => _isScanning = false);
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
     final bgPaint = Paint()..color = const Color(0xFF1E293B);
-    canvas.drawRect(Rect.fromLTWH(0, 0, 1080, 1920), bgPaint);
+    canvas.drawRect(const Rect.fromLTWH(0, 0, 1080, 1920), bgPaint);
 
     _drawSimulatedShelf(canvas);
     _drawBoxesOnCanvas(canvas);
@@ -243,29 +272,17 @@ class _CameraScanScreenState extends State<CameraScanScreen> with TickerProvider
   }
 
   Widget _buildCameraBackground() {
-    return Stack(
-      children: [
-        Container(
-          width: double.infinity,
-          height: double.infinity,
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [Color(0xFF334155), Color(0xFF475569), Color(0xFF1E293B)],
-            ),
-          ),
-        ),
-        AnimatedOpacity(
-          opacity: _flashEnabled ? 0.3 : 0.0,
-          duration: const Duration(milliseconds: 200),
-          child: Container(
-            color: Colors.white,
-            width: double.infinity,
-            height: double.infinity,
-          ),
-        ),
-      ],
+    return FutureBuilder<void>(
+      future: _initializeControllerFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.done && _controller != null) {
+          return SizedBox.expand(
+            child: CameraPreview(_controller!),
+          );
+        } else {
+          return const Center(child: CircularProgressIndicator(color: Colors.white));
+        }
+      },
     );
   }
 
@@ -287,6 +304,7 @@ class _CameraScanScreenState extends State<CameraScanScreen> with TickerProvider
           boxShadow: const [BoxShadow(color: Color(0xFF14B8A6), blurRadius: 30, spreadRadius: 2)],
         ),
         child: Stack(
+          clipBehavior: Clip.none,
           children: [
             _buildConfidenceBadge(box),
             _buildBoxCorners(),
@@ -526,127 +544,176 @@ class ImageCropperScreen extends StatefulWidget {
 }
 
 class _ImageCropperScreenState extends State<ImageCropperScreen> {
-  double scale = 1.0;
-  Offset offset = Offset.zero;
-  late Rect cropRect;
-  late Size imageSize;
-  Uint8List? imageBytes;
+  late Rect _cropRect;
+  late Size _displaySize;
 
   @override
   void initState() {
     super.initState();
-    imageSize = Size(widget.capturedImage.width.toDouble(), widget.capturedImage.height.toDouble());
-    cropRect = Rect.fromLTWH(0, 0, imageSize.width, imageSize.height);
-    _loadImageBytes();
-  }
-
-  Future<void> _loadImageBytes() async {
-    final byteData = await widget.capturedImage.toByteData(format: ui.ImageByteFormat.png);
-    if (mounted) setState(() => imageBytes = byteData!.buffer.asUint8List());
+    _cropRect = const Rect.fromLTWH(50, 100, 300, 400);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: _buildAppBar(),
-      body: imageBytes == null ? const Center(child: CircularProgressIndicator()) : _buildCropBody(),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onCancel),
+        title: const Text("Crop Scan", style: TextStyle(color: Colors.white)),
+        actions: [
+          TextButton(
+            onPressed: _processCrop,
+            child: const Text("Done", style: TextStyle(color: Color(0xFF4ADE80), fontSize: 18, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          _displaySize = Size(constraints.maxWidth, constraints.maxHeight);
+          return Stack(
+            children: [
+              Center(
+                child: RawImage(
+                  image: widget.capturedImage,
+                  fit: BoxFit.contain,
+                  width: constraints.maxWidth,
+                  height: constraints.maxHeight,
+                ),
+              ),
+
+              ColorFiltered(
+                colorFilter: ColorFilter.mode(Colors.black.withOpacity(0.7), BlendMode.srcOut),
+                child: Stack(
+                  children: [
+                    Container(color: Colors.black.withOpacity(0.01)), 
+                      rect: _cropRect,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              Positioned.fromRect(
+                rect: _cropRect,
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.white, width: 2),
+                  ),
+                  child: CustomPaint(painter: CropGridPainter()),
+                ),
+              ),
+
+              _buildHandle(0, 0), 
+              _buildHandle(1, 0), 
+              _buildHandle(0, 1), 
+              _buildHandle(1, 1), 
+
+              Positioned.fromRect(
+                rect: _cropRect.deflate(20),
+                child: GestureDetector(
+                  onPanUpdate: (details) {
+                    setState(() {
+                      _cropRect = _cropRect.shift(details.delta);
+                    });
+                  },
+                ),
+              ),
+
+              const Positioned(
+                bottom: 40, left: 0, right: 0,
+                child: Center(
+                  child: Text("Drag corners to resize crop area", style: TextStyle(color: Colors.white70)),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 
-  PreferredSizeWidget _buildAppBar() {
-    return AppBar(
-      backgroundColor: Colors.transparent,
-      elevation: 0,
-      leading: IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onCancel),
-      title: const Text("Crop Image", style: TextStyle(color: Colors.white)),
-      actions: [
-        TextButton(
-          onPressed: _processCrop,
-          child: const Text("Done", style: TextStyle(color: Colors.green, fontSize: 16)),
+  Widget _buildHandle(double relX, double relY) {
+    const double handleSize = 30.0;
+    return Positioned(
+      left: _cropRect.left + (relX * _cropRect.width) - (handleSize / 2),
+      top: _cropRect.top + (relY * _cropRect.height) - (handleSize / 2),
+      child: GestureDetector(
+        onPanUpdate: (details) {
+          setState(() {
+            double newLeft = _cropRect.left;
+            double newTop = _cropRect.top;
+            double newRight = _cropRect.right;
+            double newBottom = _cropRect.bottom;
+
+            if (relX == 0) newLeft += details.delta.dx;
+            else newRight += details.delta.dx;
+
+            if (relY == 0) newTop += details.delta.dy;
+            else newBottom += details.delta.dy;
+
+            _cropRect = Rect.fromLTRB(
+              min(newLeft, newRight - 50),
+              min(newTop, newBottom - 50),
+              max(newRight, newLeft + 50),
+              max(newBottom, newTop + 50),
+            );
+          });
+        },
+        child: Container(
+          width: handleSize,
+          height: handleSize,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFF2563EB), width: 3),
+          ),
         ),
-      ],
+      ),
     );
   }
 
   Future<void> _processCrop() async {
+    final double scaleX = widget.capturedImage.width / _displaySize.width;
+    final double scaleY = widget.capturedImage.height / _displaySize.height;
+
+    final Rect realRect = Rect.fromLTWH(
+      _cropRect.left * scaleX,
+      _cropRect.top * scaleY,
+      _cropRect.width * scaleX,
+      _cropRect.height * scaleY,
+    );
+
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
-    canvas.drawImageRect(widget.capturedImage, cropRect, Rect.fromLTWH(0, 0, cropRect.width, cropRect.height), Paint());
+    canvas.drawImageRect(
+      widget.capturedImage,
+      realRect,
+      Rect.fromLTWH(0, 0, realRect.width, realRect.height),
+      Paint(),
+    );
     final picture = recorder.endRecording();
-    final croppedImage = await picture.toImage(cropRect.width.toInt(), cropRect.height.toInt());
+    final croppedImage = await picture.toImage(realRect.width.toInt(), realRect.height.toInt());
     widget.onCropComplete(croppedImage);
   }
+}
 
-  Widget _buildCropBody() {
-    return LayoutBuilder(builder: (context, constraints) {
-      return Stack(
-        children: [
-          Center(
-            child: GestureDetector(
-              onScaleUpdate: (details) {
-                setState(() {
-                  scale = (scale * details.scale).clamp(1.0, 3.0);
-                  offset += details.focalPointDelta;
-                });
-              },
-              child: Transform(
-                transform: Matrix4.identity()..translate(offset.dx, offset.dy)..scale(scale),
-                child: Image.memory(imageBytes!, width: imageSize.width, height: imageSize.height, fit: BoxFit.cover),
-              ),
-            ),
-          ),
-          _buildOverlayArea(constraints),
-          _buildCropControls(),
-        ],
-      );
-    });
+class CropGridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.white.withOpacity(0.5)..strokeWidth = 1;
+    canvas.drawLine(Offset(size.width / 3, 0), Offset(size.width / 3, size.height), paint);
+    canvas.drawLine(Offset(2 * size.width / 3, 0), Offset(2 * size.width / 3, size.height), paint);
+    canvas.drawLine(Offset(0, size.height / 3), Offset(size.width, size.height / 3), paint);
+    canvas.drawLine(Offset(0, 2 * size.height / 3), Offset(size.width, 2 * size.height / 3), paint);
   }
-
-  Widget _buildOverlayArea(BoxConstraints constraints) {
-    return Positioned.fill(
-      child: Container(
-        color: Colors.black.withOpacity(0.5),
-        child: Center(
-          child: Container(
-            width: constraints.maxWidth * 0.9,
-            height: constraints.maxHeight * 0.7,
-            decoration: BoxDecoration(border: Border.all(color: Colors.white, width: 2), borderRadius: BorderRadius.circular(8)),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCropControls() {
-    return Positioned(
-      bottom: 40, left: 20, right: 20,
-      child: Column(
-        children: [
-          Text("Drag and pinch to adjust crop area", style: TextStyle(color: Colors.white.withOpacity(0.7))),
-          const SizedBox(height: 16),
-          _buildResetButton(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildResetButton() {
-    return GestureDetector(
-      onTap: () => setState(() {
-        scale = 1.0;
-        offset = Offset.zero;
-        cropRect = Rect.fromLTWH(0, 0, imageSize.width, imageSize.height);
-      }),
-      child: Column(
-        children: [
-          Container(padding: const EdgeInsets.all(12), decoration: const BoxDecoration(color: Colors.white24, shape: BoxShape.circle), child: const Icon(Icons.crop_free, color: Colors.white)),
-          const SizedBox(height: 8),
-          const Text("Reset", style: TextStyle(color: Colors.white, fontSize: 12)),
-        ],
-      ),
-    );
-  }
+  @override bool shouldRepaint(CustomPainter old) => false;
 }
 
 // Result!
@@ -673,11 +740,9 @@ class ScanResultsScreen extends StatefulWidget {
 
 class _ScanResultsScreenState extends State<ScanResultsScreen> with TickerProviderStateMixin {
   late int _boxCount;
-
   String _shelfName = "Shelf A";
   bool _isEditingShelf = false;
   final TextEditingController _shelfController = TextEditingController();
-
   late AnimationController _successAnimController;
   late Animation<Offset> _slideAnimation;
   bool _showSuccessOverlay = false;
@@ -687,18 +752,8 @@ class _ScanResultsScreenState extends State<ScanResultsScreen> with TickerProvid
     super.initState();
     _boxCount = widget.totalCount;
     _shelfController.text = _shelfName;
-
-    _successAnimController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 600),
-    );
-    _slideAnimation = Tween<Offset>(
-      begin: const Offset(0, 1.5),
-      end: Offset.zero,
-    ).animate(CurvedAnimation(
-      parent: _successAnimController,
-      curve: Curves.elasticOut,
-    ));
+    _successAnimController = AnimationController(vsync: this, duration: const Duration(milliseconds: 600));
+    _slideAnimation = Tween<Offset>(begin: const Offset(0, 1.5), end: Offset.zero).animate(CurvedAnimation(parent: _successAnimController, curve: Curves.elasticOut));
   }
 
   @override
@@ -711,10 +766,7 @@ class _ScanResultsScreenState extends State<ScanResultsScreen> with TickerProvid
   void _confirmAndSave() {
     setState(() => _showSuccessOverlay = true);
     _successAnimController.forward();
-
-    Future.delayed(const Duration(milliseconds: 2500), () {
-      if (mounted) Navigator.pop(context);
-    });
+    Future.delayed(const Duration(milliseconds: 2500), () => Navigator.pop(context));
   }
 
   @override
@@ -762,50 +814,15 @@ class _ScanResultsScreenState extends State<ScanResultsScreen> with TickerProvid
               margin: const EdgeInsets.symmetric(horizontal: 40),
               padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
               decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF059669), Color(0xFF10B981)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
+                gradient: const LinearGradient(colors: [Color(0xFF059669), Color(0xFF10B981)]),
                 borderRadius: BorderRadius.circular(30),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.green.withOpacity(0.4),
-                    blurRadius: 30,
-                    spreadRadius: 5,
-                  )
-                ],
               ),
-              child: Column(
+              child: const Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.all(15),
-                    decoration: const BoxDecoration(
-                      color: Colors.white,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(Icons.check_rounded, size: 50, color: Color(0xFF059669)),
-                  ),
-                  const SizedBox(height: 20),
-                  const Text(
-                    "SCAN CONFIRMED",
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 22,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    "Data saved successfully",
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.9),
-                      fontSize: 16,
-                      fontWeight: FontWeight.w400,
-                    ),
-                  ),
+                  Icon(Icons.check_circle, size: 80, color: Colors.white),
+                  SizedBox(height: 20),
+                  Text("SCAN CONFIRMED", style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
                 ],
               ),
             ),
@@ -860,7 +877,9 @@ class _ScanResultsScreenState extends State<ScanResultsScreen> with TickerProvid
       height: 260,
       width: double.infinity,
       decoration: BoxDecoration(borderRadius: BorderRadius.circular(24), color: const Color(0xFF1E293B)),
-      child: const Center(child: Icon(Icons.image, color: Colors.white24, size: 50)),
+      child: widget.capturedImage != null
+          ? ClipRRect(borderRadius: BorderRadius.circular(24), child: RawImage(image: widget.capturedImage, fit: BoxFit.cover))
+          : const Center(child: Icon(Icons.image, color: Colors.white24, size: 50)),
     );
   }
 
@@ -932,6 +951,5 @@ class GridPainter extends CustomPainter {
     for (double x = 0; x < size.width; x += 40) { canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint); }
     for (double y = 0; y < size.height; y += 40) { canvas.drawLine(Offset(0, y), Offset(size.width, y), paint); }
   }
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  @override bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
