@@ -10,33 +10,47 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-
   flutter_localizations:
     sdk: flutter
 
-  camera: ^0.10.5
-  provider: ^6.1.1
-  shared_preferences: ^2.2.2
-  local_auth: ^2.3.0 # For Fingerprint/FaceID
-  image_picker: ^1.0.7
+  # Réseau & API
+  http: ^1.2.0
 
+  # Base de données & Stockage
+  sqflite: ^2.3.0
+  path: ^1.8.0
+  shared_preferences: ^2.2.2
+  path_provider: ^2.1.2
+
+  # Gestion d'état
+  provider: ^6.1.1
+
+  # Sécurité & Authentification
+  local_auth: ^2.3.0
+  crypto: ^3.0.3
+
+  # Caméra, Images & ML (OCR)
+  camera: ^0.10.5
+  image_picker: ^1.0.7
+  google_mlkit_text_recognition: ^0.13.0
+
+  # Interface Utilisateur (UI) & Graphiques
   lucide_icons: ^0.257.0
   cupertino_icons: ^1.0.8
   fl_chart: ^0.66.0
   google_fonts: ^6.2.1
+
+  # Rapports & Partage
+  pdf: ^3.10.10
+  printing: ^5.13.2
+  excel: ^4.0.6
+  share_plus: ^10.1.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
   flutter_launcher_icons: ^0.13.1
-  share_plus: ^10.1.0
-  pdf: ^3.10.10
-  printing: ^5.13.2
-  excel: ^4.0.6
-  path_provider: ^2.1.2
-  image_picker: ^1.0.7
-
 
 flutter_launcher_icons:
   android: "launcher_icon"
@@ -51,3 +65,4 @@ flutter:
     - assets/
     - assets/logo.png
     - assets/authlogo.png
+    - assets/data/medicines.json
