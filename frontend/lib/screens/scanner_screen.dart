@@ -9,6 +9,11 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:http/http.dart' as http;
 
+// OCR + medicine matching
+import '../features/ocr/services/ocr_service.dart';
+import '../features/ocr/services/medicine_matcher_service.dart';
+import '../features/ocr/models/ocr_result.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Data Model
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1038,6 +1043,12 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
   final Map<int, Uint8List?> _crops = {};
   bool _loadingCrops = false;
 
+  // OCR results — key = box.id
+  final Map<int, OcrResult?> _ocrResults = {};
+
+  final OCRService _ocrService = OCRService();
+  final MedicineMatcherService _matcher = MedicineMatcherService();
+
   @override
   void initState() {
     super.initState();
@@ -1051,17 +1062,27 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
         .animate(
             CurvedAnimation(parent: _successAnim, curve: Curves.elasticOut));
 
-    _fetchCrops();
+    _loadMatcherAndFetchCrops();
   }
 
   @override
   void dispose() {
     _shelfCtrl.dispose();
     _successAnim.dispose();
+    OCRService.disposeRecognizer();
     super.dispose();
   }
 
-  // ── Fetch crops from backend ───────────────────────────────────────────────
+  // ── Load medicine list, then fetch crops + run OCR ───────────────────────
+
+  Future<void> _loadMatcherAndFetchCrops() async {
+    try {
+      await _matcher.load();
+    } catch (e) {
+      debugPrint("MedicineMatcherService load error: $e");
+    }
+    await _fetchCrops();
+  }
 
   Future<void> _fetchCrops() async {
     setState(() => _loadingCrops = true);
@@ -1080,7 +1101,11 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
         final resp = await request.send();
         if (resp.statusCode == 200) {
           final bytes = await resp.stream.toBytes();
-          if (mounted) setState(() => _crops[box.id] = bytes);
+          if (mounted) {
+            setState(() => _crops[box.id] = bytes);
+          }
+          // Run OCR on this crop in the background
+          _runOcrOnCrop(box.id, bytes);
         } else {
           if (mounted) setState(() => _crops[box.id] = null);
         }
@@ -1090,6 +1115,20 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
       }
     }
     if (mounted) setState(() => _loadingCrops = false);
+  }
+
+  // ── Run ML Kit OCR on a single crop, then parse name/form/dosage ──────────
+
+  Future<void> _runOcrOnCrop(int boxId, Uint8List bytes) async {
+    try {
+      final String rawText =
+          await _ocrService.processBytes(bytes, tag: 'box_$boxId');
+      final OcrResult result = _matcher.parse(rawText);
+      if (mounted) setState(() => _ocrResults[boxId] = result);
+    } catch (e) {
+      debugPrint("OCR error for box $boxId: $e");
+      if (mounted) setState(() => _ocrResults[boxId] = null);
+    }
   }
 
   void _confirmSave() {
@@ -1283,14 +1322,19 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
           itemBuilder: (_, i) {
             final b = widget.detectedBoxes[i];
             final cropBytes = _crops[b.id];
-            return _buildCropCard(b, cropBytes);
+            final ocrResult = _ocrResults[b.id];
+            final ocrDone = _ocrResults.containsKey(b.id);
+            return _buildCropCard(b, cropBytes, ocrResult: ocrResult, ocrDone: ocrDone);
           },
         ),
       ],
     );
   }
 
-  Widget _buildCropCard(DetectedBox b, Uint8List? bytes) {
+  Widget _buildCropCard(DetectedBox b, Uint8List? bytes,
+      {OcrResult? ocrResult, bool ocrDone = false}) {
+    final bool ocrLoading = bytes != null && !ocrDone;
+
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
@@ -1301,6 +1345,7 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // ── Crop image ──────────────────────────────────────────────────
           Expanded(
             child: bytes != null
                 ? Image.memory(bytes, fit: BoxFit.cover)
@@ -1315,24 +1360,136 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
                     ),
                   ),
           ),
+          // ── Info panel ──────────────────────────────────────────────────
           Padding(
-            padding: const EdgeInsets.all(6),
+            padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(b.label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontSize: 11, fontWeight: FontWeight.bold)),
-                Text("${(b.confidence * 100).round()}%",
-                    style: const TextStyle(
-                        fontSize: 10, color: Color(0xFF14B8A6))),
+                // YOLO confidence badge
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(b.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 11, fontWeight: FontWeight.bold)),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 5, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF14B8A6).withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        "${(b.confidence * 100).round()}%",
+                        style: const TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF0F9688)),
+                      ),
+                    ),
+                  ],
+                ),
+
+                // ── OCR loading indicator ────────────────────────────────
+                if (ocrLoading) ...[
+                  const SizedBox(height: 5),
+                  Row(children: const [
+                    SizedBox(
+                        width: 9,
+                        height: 9,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 1.5, color: Color(0xFF6366F1))),
+                    SizedBox(width: 5),
+                    Text("Lecture OCR...",
+                        style:
+                            TextStyle(fontSize: 9, color: Color(0xFF6366F1))),
+                  ]),
+                ],
+
+                // ── OCR results ──────────────────────────────────────────
+                if (ocrDone && ocrResult != null) ...[
+                  const SizedBox(height: 5),
+                  const Divider(height: 1, thickness: 0.5, color: Color(0xFFE2E8F0)),
+                  const SizedBox(height: 4),
+
+                  // Medicine name
+                  _ocrRow(
+                    icon: Icons.medication_outlined,
+                    iconColor: const Color(0xFF6366F1),
+                    label: ocrResult.hasName ? ocrResult.matchedName! : '—',
+                    labelStyle: ocrResult.hasName
+                        ? const TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFF1E293B))
+                        : const TextStyle(
+                            fontSize: 10, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 3),
+
+                  // Form / type
+                  _ocrRow(
+                    icon: Icons.category_outlined,
+                    iconColor: const Color(0xFF0EA5E9),
+                    label: ocrResult.hasForm ? ocrResult.form! : '—',
+                    labelStyle: TextStyle(
+                        fontSize: 9,
+                        color: ocrResult.hasForm
+                            ? const Color(0xFF475569)
+                            : Colors.grey),
+                  ),
+                  const SizedBox(height: 3),
+
+                  // Dosage
+                  _ocrRow(
+                    icon: Icons.science_outlined,
+                    iconColor: const Color(0xFFF59E0B),
+                    label: ocrResult.hasDosage ? ocrResult.dosage! : '—',
+                    labelStyle: TextStyle(
+                        fontSize: 9,
+                        color: ocrResult.hasDosage
+                            ? const Color(0xFF475569)
+                            : Colors.grey),
+                  ),
+                ],
+
+                // ── Nothing recognized at all ────────────────────────────
+                if (ocrDone && ocrResult == null) ...[
+                  const SizedBox(height: 4),
+                  const Text("OCR: aucun texte détecté",
+                      style: TextStyle(fontSize: 9, color: Colors.grey)),
+                ],
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+
+  /// Small icon + text row used in the OCR panel.
+  Widget _ocrRow({
+    required IconData icon,
+    required Color iconColor,
+    required String label,
+    required TextStyle labelStyle,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 11, color: iconColor),
+        const SizedBox(width: 4),
+        Expanded(
+          child: Text(label,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: labelStyle),
+        ),
+      ],
     );
   }
 
