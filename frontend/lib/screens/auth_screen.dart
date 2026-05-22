@@ -1,5 +1,7 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../providers/auth_provider.dart';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -12,16 +14,16 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   bool isSignIn = true;
   bool showPassword = false;
 
-  final Color bgGrey = const Color(0xDF939090);
+  final Color bgGrey      = const Color(0xDF939090);
   final Color brownShadow = const Color(0xE2030303);
   final Color bioBlueFaded = const Color(0xFF5C9DED);
 
   final _formKey = GlobalKey<FormState>();
-  final TextEditingController _emailController = TextEditingController();
-  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _emailController           = TextEditingController();
+  final TextEditingController _passwordController        = TextEditingController();
   final TextEditingController _confirmPasswordController = TextEditingController();
 
-   @override
+  @override
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
@@ -29,8 +31,36 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
     super.dispose();
   }
 
-  void _handleSubmit() {
-    if (_formKey.currentState!.validate()) {
+  void _handleSubmit() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    final auth = Provider.of<AuthProvider>(context, listen: false);
+
+    if (isSignIn) {
+      final error = await auth.login(
+        _emailController.text.trim(),
+        _passwordController.text,
+      );
+      if (error != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error), backgroundColor: Colors.red),
+        );
+        return;
+      }
+    } else {
+      final error = await auth.register(
+        _emailController.text.trim(),
+        _passwordController.text,
+      );
+      if (error != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error), backgroundColor: Colors.red),
+        );
+        return;
+      }
+    }
+
+    if (mounted) {
       Navigator.pushReplacementNamed(context, '/dashboard');
     }
   }
@@ -149,12 +179,12 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
       height: 100,
       padding: const EdgeInsets.all(0),
       decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.05),
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white.withOpacity(0.1)),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 20, offset: const Offset(0, 10))
-          ]
+        color: Colors.white.withOpacity(0.05),
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white.withOpacity(0.1)),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 20, offset: const Offset(0, 10))
+        ],
       ),
       child: ClipOval(
         child: Image.asset(
@@ -168,7 +198,11 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   Widget _buildLabel(String text) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8, left: 4),
-      child: Text(text, style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 14, fontWeight: FontWeight.w500)),
+      child: Text(text,
+          style: TextStyle(
+              color: Colors.white.withOpacity(0.8),
+              fontSize: 14,
+              fontWeight: FontWeight.w500)),
     );
   }
 
@@ -188,15 +222,24 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         hintText: hint,
         hintStyle: TextStyle(color: Colors.white.withOpacity(0.2)),
         prefixIcon: Icon(icon, color: bioBlueFaded.withOpacity(0.7), size: 22),
-        suffixIcon: isPassword ? IconButton(
-          icon: Icon(showPassword ? Icons.visibility : Icons.visibility_off, color: Colors.white.withOpacity(0.3)),
-          onPressed: () => setState(() => showPassword = !showPassword),
-        ) : null,
+        suffixIcon: isPassword
+            ? IconButton(
+                icon: Icon(
+                    showPassword ? Icons.visibility : Icons.visibility_off,
+                    color: Colors.white.withOpacity(0.3)),
+                onPressed: () => setState(() => showPassword = !showPassword),
+              )
+            : null,
         filled: true,
         fillColor: Colors.white.withOpacity(0.05),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
-        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: Colors.white.withOpacity(0.05))),
-        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: bioBlueFaded.withOpacity(0.5))),
+        border:
+            OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+        enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(16),
+            borderSide: BorderSide(color: Colors.white.withOpacity(0.05))),
+        focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(16),
+            borderSide: BorderSide(color: bioBlueFaded.withOpacity(0.5))),
         errorStyle: const TextStyle(color: Colors.redAccent),
       ),
     );
@@ -207,10 +250,10 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
       width: double.infinity,
       height: 58,
       decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 15, offset: const Offset(0, 5))
-          ]
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 15, offset: const Offset(0, 5))
+        ],
       ),
       child: ElevatedButton(
         onPressed: _handleSubmit,
