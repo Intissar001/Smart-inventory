@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:http/http.dart' as http;
 
@@ -1121,9 +1122,20 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
 
   Future<void> _runOcrOnCrop(int boxId, Uint8List bytes) async {
     try {
-      final String rawText =
-          await _ocrService.processBytes(bytes, tag: 'box_$boxId');
-      final OcrResult result = _matcher.parse(rawText);
+      // SIZE-ONLY MODE: DB matching disabled.
+      // Display only the visually largest word to test size-comparison logic.
+      final OcrRawResult raw =
+          await _ocrService.processBytesRich(bytes, tag: 'box_$boxId');
+
+      final OcrResult result = OcrResult(
+        matchedName: null,
+        form: null,
+        dosage: null,
+        rawText: raw.fullText,
+        confidence: 0.0,
+        largestText: raw.largestText,
+      );
+
       if (mounted) setState(() => _ocrResults[boxId] = result);
     } catch (e) {
       debugPrint("OCR error for box $boxId: $e");
@@ -1345,20 +1357,53 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── Crop image ──────────────────────────────────────────────────
+          // ── Crop image (tap → raw OCR debug sheet) ──────────────────
           Expanded(
-            child: bytes != null
-                ? Image.memory(bytes, fit: BoxFit.cover)
-                : Container(
-                    color: const Color(0xFF1E293B),
-                    child: const Center(
-                      child: SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Color(0xFF14B8A6))),
+            child: GestureDetector(
+              onTap: ocrDone
+                  ? () => _showRawOcrSheet(
+                        context,
+                        boxId: b.id,
+                        label: b.label,
+                        bytes: bytes,
+                        ocrResult: ocrResult,
+                      )
+                  : null,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  bytes != null
+                      ? Image.memory(bytes, fit: BoxFit.cover)
+                      : Container(
+                          color: const Color(0xFF1E293B),
+                          child: const Center(
+                            child: SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Color(0xFF14B8A6))),
+                          ),
+                        ),
+                  // Small "tap to inspect" hint once OCR is done
+                  if (ocrDone)
+                    Positioned(
+                      bottom: 4,
+                      right: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Icon(Icons.text_snippet_outlined,
+                            size: 11, color: Colors.white),
+                      ),
                     ),
-                  ),
+                ],
+              ),
+            ),
           ),
           // ── Info panel ──────────────────────────────────────────────────
           Padding(
@@ -1416,19 +1461,62 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
                   const Divider(height: 1, thickness: 0.5, color: Color(0xFFE2E8F0)),
                   const SizedBox(height: 4),
 
-                  // Medicine name
-                  _ocrRow(
-                    icon: Icons.medication_outlined,
-                    iconColor: const Color(0xFF6366F1),
-                    label: ocrResult.hasName ? ocrResult.matchedName! : '—',
-                    labelStyle: ocrResult.hasName
-                        ? const TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            color: Color(0xFF1E293B))
-                        : const TextStyle(
-                            fontSize: 10, color: Colors.grey),
-                  ),
+                  // Medicine name — DB match OR largest visual text fallback
+                  if (ocrResult.hasName) ...[
+                    // ✅ Matched in database
+                    _ocrRow(
+                      icon: Icons.medication_outlined,
+                      iconColor: const Color(0xFF6366F1),
+                      label: ocrResult.matchedName!,
+                      labelStyle: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF1E293B)),
+                    ),
+                  ] else if (ocrResult.hasLargestText) ...[
+                    // 📝 Fallback — largest text on the box (brand name heuristic)
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.text_fields_rounded,
+                            size: 11, color: Color(0xFFF97316)),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            ocrResult.largestText!,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFFF97316),
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF97316).withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text('OCR',
+                              style: TextStyle(
+                                  fontSize: 7,
+                                  color: Color(0xFFF97316),
+                                  fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ),
+                  ] else ...[
+                    _ocrRow(
+                      icon: Icons.medication_outlined,
+                      iconColor: const Color(0xFF6366F1),
+                      label: '—',
+                      labelStyle:
+                          const TextStyle(fontSize: 10, color: Colors.grey),
+                    ),
+                  ],
                   const SizedBox(height: 3),
 
                   // Form / type
@@ -1455,6 +1543,15 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
                             ? const Color(0xFF475569)
                             : Colors.grey),
                   ),
+
+                  // Fallback warning
+                  if (ocrResult.isFallback) ...[
+                    const SizedBox(height: 3),
+                    const Text(
+                      '⚠ Non trouvé en base',
+                      style: TextStyle(fontSize: 7, color: Colors.orange),
+                    ),
+                  ],
                 ],
 
                 // ── Nothing recognized at all ────────────────────────────
@@ -1490,6 +1587,28 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
               style: labelStyle),
         ),
       ],
+    );
+  }
+
+  // ── Raw OCR debug bottom sheet ───────────────────────────────────────────
+
+  void _showRawOcrSheet(
+    BuildContext context, {
+    required int boxId,
+    required String label,
+    required Uint8List? bytes,
+    required OcrResult? ocrResult,
+  }) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _OcrDebugSheet(
+        boxId: boxId,
+        label: label,
+        bytes: bytes,
+        ocrResult: ocrResult,
+      ),
     );
   }
 
@@ -1575,4 +1694,209 @@ class _GridPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter _) => false;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OCR Debug Bottom Sheet
+// ═════════════════════════════════════════════════════════════════════════════
+
+class _OcrDebugSheet extends StatelessWidget {
+  final int boxId;
+  final String label;
+  final Uint8List? bytes;
+  final OcrResult? ocrResult;
+
+  const _OcrDebugSheet({
+    required this.boxId,
+    required this.label,
+    required this.bytes,
+    required this.ocrResult,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final raw = ocrResult?.rawText ?? '';
+    final lines = raw.isEmpty
+        ? <String>[]
+        : raw.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+
+    return DraggableScrollableSheet(
+      initialChildSize: 0.6,
+      minChildSize: 0.35,
+      maxChildSize: 0.92,
+      expand: false,
+      builder: (_, scrollCtrl) => Container(
+        decoration: const BoxDecoration(
+          color: Color(0xFF0F172A),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        child: Column(
+          children: [
+            // ── Handle ────────────────────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.only(top: 10, bottom: 4),
+              child: Container(
+                width: 38,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+
+            // ── Header row ────────────────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
+              child: Row(
+                children: [
+                  // Crop thumbnail
+                  if (bytes != null)
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.memory(bytes!,
+                          width: 54, height: 54, fit: BoxFit.cover),
+                    ),
+                  if (bytes != null) const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Box #$boxId — $label',
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 3),
+                        Text(
+                          '${lines.length} ligne(s) OCR extraite(s)',
+                          style: const TextStyle(
+                              color: Color(0xFF94A3B8), fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Copy button
+                  IconButton(
+                    icon: const Icon(Icons.copy_rounded,
+                        color: Color(0xFF14B8A6), size: 18),
+                    tooltip: 'Copier le texte brut',
+                    onPressed: raw.isEmpty
+                        ? null
+                        : () {
+                            Clipboard.setData(ClipboardData(text: raw));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Texte copié'),
+                                duration: Duration(seconds: 1),
+                              ),
+                            );
+                          },
+                  ),
+                ],
+              ),
+            ),
+
+            const Divider(height: 1, color: Color(0xFF1E293B)),
+
+            // ── Parsed summary strip ──────────────────────────────────────
+            if (ocrResult != null)
+              Container(
+                color: const Color(0xFF1E293B),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 8),
+                child: Row(
+                  children: [
+                    _chip(Icons.medication_outlined, const Color(0xFF6366F1),
+                        ocrResult!.matchedName ?? '—'),
+                    const SizedBox(width: 8),
+                    _chip(Icons.category_outlined, const Color(0xFF0EA5E9),
+                        ocrResult!.form ?? '—'),
+                    const SizedBox(width: 8),
+                    _chip(Icons.science_outlined, const Color(0xFFF59E0B),
+                        ocrResult!.dosage ?? '—'),
+                  ],
+                ),
+              ),
+
+            const Divider(height: 1, color: Color(0xFF1E293B)),
+
+            // ── Raw OCR lines list ────────────────────────────────────────
+            Expanded(
+              child: raw.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'Aucun texte extrait par ML Kit.',
+                        style: TextStyle(color: Color(0xFF64748B)),
+                      ),
+                    )
+                  : ListView.separated(
+                      controller: scrollCtrl,
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                      itemCount: lines.length,
+                      separatorBuilder: (_, __) => const Divider(
+                          height: 1, color: Color(0xFF1E293B)),
+                      itemBuilder: (_, i) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 9),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            // Line number badge
+                            Container(
+                              width: 22,
+                              height: 22,
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E293B),
+                                borderRadius: BorderRadius.circular(5),
+                              ),
+                              child: Text(
+                                '${i + 1}',
+                                style: const TextStyle(
+                                    color: Color(0xFF64748B),
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: SelectableText(
+                                lines[i],
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                  fontFamily: 'monospace',
+                                  height: 1.4,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _chip(IconData icon, Color color, String text) => Expanded(
+        child: Row(
+          children: [
+            Icon(icon, size: 11, color: color),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                text,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: text == '—' ? const Color(0xFF475569) : Colors.white,
+                    fontSize: 10),
+              ),
+            ),
+          ],
+        ),
+      );
 }
