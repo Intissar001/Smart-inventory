@@ -3,23 +3,18 @@ import 'package:flutter/services.dart';
 import '../models/ocr_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MedicineMatcherService — v3
+// MedicineMatcherService — v4
 //
-// What changed vs v2:
-//   • Pharmaceutical forms are now loaded from
-//     assets/data/formes_pharmaceutiques.json  (no more hardcoded list)
-//   • Form matching uses FUZZY Levenshtein sliding-window search so that
-//     OCR errors (1-2 wrong letters) still find the right form.
-//   • The rest of the pipeline (name matching) is unchanged.
-//
-// Form matching algorithm:
-//   For each phrase in the JSON list:
-//     1. Normalize it (uppercase + accent-strip) — same pipeline as OCR text.
-//     2. Split the OCR text into overlapping windows of the same word-count.
-//     3. Compute Levenshtein similarity between the phrase and each window.
-//     4. Accept the best match if similarity ≥ _formThreshold.
-//   Multi-word phrases (e.g. "COMPRIME PELLICULE") are tried before shorter
-//   ones so they win over a partial single-word match.
+// What changed vs v3:
+//   • _loadDosageEntries now filters out posology/count entries
+//     (comprimé, gélule, goutte, sachet…) so "2 comprimés" / "1 goutte"
+//     are never returned as dosage — blank is better than wrong.
+//   • _normalizeDosage inserts spaces between fused letter+digit sequences
+//     (e.g. "de2 ml" → "de 2 ml") so the sliding-window tokenizer finds "2 ml".
+//   • New _preProcessOcrForDosage step applied before both JSON and regex
+//     passes: fixes "S mg" → "5 mg" and "I00 mg" → "100 mg" OCR confusions.
+//   • _extractDosageRegex now uses _normalizeDosage instead of _normalizePlain
+//     so the same OCR corrections apply in the fallback path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class MedicineMatcherService {
@@ -143,6 +138,9 @@ class MedicineMatcherService {
 
   /// Parses dosage_complet.json and builds the sorted _dosageEntries list.
   /// Only the "values_with_units" array is used for matching.
+  /// Entries that describe posology (comprimé, gélule, goutte, sachet…)
+  /// are intentionally excluded — those belong on the packaging description,
+  /// not the concentration/dosage field.
   Future<void> _loadDosageEntries() async {
     _dosageEntries.clear();
     try {
@@ -155,6 +153,11 @@ class MedicineMatcherService {
       for (final v in values) {
         final String original = (v as String).trim();
         if (original.isEmpty) continue;
+
+        // ── Skip posology / count entries ────────────────────────────────
+        // These describe "how many to take", not the drug concentration.
+        // Accepting them causes false positives like "2 comprimés", "1 goutte".
+        if (_isPosologyEntry(original)) continue;
 
         // Normalize: keep digits, letters, common dosage symbols
         final String normalized = _normalizeDosage(original);
@@ -179,6 +182,16 @@ class MedicineMatcherService {
       // App keeps working; _extractDosage falls back to regex only.
     }
   }
+
+  /// Returns true for entries that describe posology (count of units to take)
+  /// rather than drug concentration/strength.
+  static final RegExp _posologyPattern = RegExp(
+    r'^\d+\s*(?:comprim[eé]s?|g[eé]lules?|capsules?|suppositoires?|sachets?|ampoules?|'
+    r'gouttes?|drops?|bouff[eé]es?|puffs?|pastilles?|ovules?|tablettes?|tablets?)',
+    caseSensitive: false,
+  );
+
+  bool _isPosologyEntry(String entry) => _posologyPattern.hasMatch(entry.trim());
 
   // ── Legacy API ────────────────────────────────────────────────────────────
 
@@ -471,15 +484,35 @@ class MedicineMatcherService {
         .replaceAll('Ù', 'U').replaceAll('Ú', 'U').replaceAll('Û', 'U').replaceAll('Ü', 'U')
         .replaceAll('Ç', 'C').replaceAll('Ñ', 'N')
         .replaceAll('µ', 'MCG')
+        // ── OCR digit↔letter corrections (context: dosage so digits matter) ──
+        // Letter → digit: common OCR errors on medicine boxes near unit words
+        .replaceAllMapped(
+          // S→5, O→0, I→1 only when immediately adjacent to digits or units
+          RegExp(r'(?<=\d)S(?=\s*(?:MG|ML|G|MCG|UI|IU|%|/|,|\.))|(?<=(?:MG|ML|G|MCG|UI|IU|%|\s))S(?=\d)'),
+          (_) => '5',
+        )
+        // Insert space between letters and digits that are fused (e.g. "de2" → "de 2", "30ML" keeps intact)
+        .replaceAllMapped(
+          RegExp(r'([A-Z]{2,})(\d)'),
+          (m) => '${m[1]} ${m[2]}',
+        )
+        .replaceAllMapped(
+          RegExp(r'(\d)([A-Z]{3,})'),
+          (m) => '${m[1]} ${m[2]}',
+        )
         .replaceAll(_dosageKeepChars, ' ')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
   }
 
   String? _extractDosage(String rawOcrText) {
+    // ── Pre-processing: fix common OCR fusions before any matching ────────
+    // "de2 ml" → "de 2 ml", "amnbules de2 ml" → spaces around digits
+    final String preprocessed = _preProcessOcrForDosage(rawOcrText);
+
     // Pass 1 — JSON-powered fuzzy matching
     if (_dosageEntries.isNotEmpty) {
-      final String normalizedOcr = _normalizeDosage(rawOcrText);
+      final String normalizedOcr = _normalizeDosage(preprocessed);
       final List<String> ocrWords = normalizedOcr
           .split(RegExp(r'\s+'))
           .where((w) => w.isNotEmpty)
@@ -516,8 +549,50 @@ class MedicineMatcherService {
       if (bestDisplay != null) return bestDisplay;
     }
 
-    // Pass 2 — Regex fallback
-    return _extractDosageRegex(rawOcrText);
+    // Pass 2 — Regex fallback (also on preprocessed text)
+    return _extractDosageRegex(preprocessed);
+  }
+
+  /// Pre-process raw OCR text to fix common fusions before dosage matching.
+  /// Examples:
+  ///   "de2 ml"        → "de 2 ml"
+  ///   "amnbules de2ml"→ "amnbules de 2 ml"
+  ///   "S mg"          → "5 mg"  (OCR S/5 confusion)
+  ///   "I00 mg"        → "100 mg" (OCR I/1 confusion)
+  String _preProcessOcrForDosage(String text) {
+    String t = text;
+
+    // Insert space between a word-char sequence ending in letters and a digit
+    // e.g. "de2" → "de 2", but "MG5" → "MG 5" (handled later by normalization)
+    t = t.replaceAllMapped(
+      RegExp(r'([a-zA-Z]{2,})(\d)'),
+      (m) => '${m[1]} ${m[2]}',
+    );
+    // Insert space between digit and letter-sequence (except common unit suffixes
+    // which are handled by _normalizeDosage)
+    t = t.replaceAllMapped(
+      RegExp(r'(\d)([a-zA-Z]{3,})'),
+      (m) => '${m[1]} ${m[2]}',
+    );
+
+    // OCR S→5 and I→1 substitutions specifically near numeric/unit contexts
+    // Replace isolated "S" between digits or between digit and unit
+    t = t.replaceAllMapped(
+      RegExp(r'(?<=\d\s?)S(?=\s?(?:mg|ml|g|mcg|µg|ui|iu|%)|(?=\s?\d))'),
+      (_) => '5',
+    );
+    // Replace leading "S" before space+unit when it looks like a number
+    t = t.replaceAllMapped(
+      RegExp(r'\bS\s+(mg|ml|g|mcg|µg|ui|iu|%)\b', caseSensitive: false),
+      (m) => '5 ${m[1]}',
+    );
+    // Replace I that looks like 1 when followed by digits (e.g. "I00" → "100")
+    t = t.replaceAllMapped(
+      RegExp(r'\bI(\d{2,})'),
+      (m) => '1${m[1]}',
+    );
+
+    return t;
   }
 
   static const List<String> _dosageUnits = [
@@ -527,7 +602,8 @@ class MedicineMatcherService {
   ];
 
   String? _extractDosageRegex(String text) {
-    final String normalized = _normalizePlain(text);
+    // Use _normalizeDosage so OCR corrections (S→5 etc.) are already applied
+    final String normalized = _normalizeDosage(text);
     final unitPattern = _dosageUnits.map(RegExp.escape).join('|');
     final re = RegExp(
       r'(\d[\d,\.]*\s*(?:' + unitPattern + r')(?:\s*/\s*\d[\d,\.]*\s*(?:' + unitPattern + r'))*)',

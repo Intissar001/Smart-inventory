@@ -4,20 +4,13 @@ import 'dart:typed_data';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:http/http.dart' as http;
-
-// OCR + medicine matching
 import '../features/ocr/services/ocr_service.dart';
 import '../features/ocr/services/medicine_matcher_service.dart';
 import '../features/ocr/models/ocr_result.dart';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Data Model
-// ─────────────────────────────────────────────────────────────────────────────
 
 class DetectedBox {
   final int id;
@@ -60,10 +53,7 @@ class DetectedBox {
       );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Camera Scan Screen
-// ─────────────────────────────────────────────────────────────────────────────
-
 class CameraScanScreen extends StatefulWidget {
   const CameraScanScreen({super.key});
 
@@ -79,7 +69,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   bool _flashEnabled = false;
   bool _isSending = false;
 
-  // ── Flash helpers ─────────────────────────────────────────────────────────
+  //Flash helpers
 
   Future<void> _toggleFlash() async {
     if (_controller == null || !_controller!.value.isInitialized) return;
@@ -105,8 +95,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   late AnimationController _pulseController;
 
-  // ⚠️  Change this to your PC's local IP when using a physical device.
-  //     For Android emulator keep http://10.0.2.2:8000/detect
   static const String _backendUrl = "http://192.168.1.2:8000/detect";
 
   @override
@@ -142,7 +130,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     super.dispose();
   }
 
-  // ── Capture → send → navigate ─────────────────────────────────────────────
+  //  Capture → send → navigate
 
   Future<void> _handleCapture() async {
     if (_controller == null || !_controller!.value.isInitialized) return;
