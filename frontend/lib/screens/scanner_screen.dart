@@ -107,7 +107,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   // ⚠️  Change this to your PC's local IP when using a physical device.
   //     For Android emulator keep http://10.0.2.2:8000/detect
-  static const String _backendUrl = "http://192.168.1.3:8000/detect";
+  static const String _backendUrl = "http://192.168.1.2:8000/detect";
 
   @override
   void initState() {
@@ -1122,15 +1122,19 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
 
   Future<void> _runOcrOnCrop(int boxId, Uint8List bytes) async {
     try {
-      // SIZE-ONLY MODE: DB matching disabled.
-      // Display only the visually largest word to test size-comparison logic.
+      // Get raw OCR text + largest visual word from ML Kit
       final OcrRawResult raw =
           await _ocrService.processBytesRich(bytes, tag: 'box_$boxId');
 
+      // Run the matcher to extract form and dosage.
+      // Name matching (DB lookup) stays disabled — we keep matchedName: null
+      // and fall back to the largest visual text for display, exactly as before.
+      final OcrResult parsed = _matcher.parse(raw.fullText);
+
       final OcrResult result = OcrResult(
-        matchedName: null,
-        form: null,
-        dosage: null,
+        matchedName: null,          // DB name matching intentionally off
+        form: parsed.form,          // ← form extracted from OCR text
+        dosage: parsed.dosage,      // ← dosage extracted from OCR text
         rawText: raw.fullText,
         confidence: 0.0,
         largestText: raw.largestText,

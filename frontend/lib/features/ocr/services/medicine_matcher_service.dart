@@ -3,20 +3,23 @@ import 'package:flutter/services.dart';
 import '../models/ocr_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MedicineMatcherService — v2 (production-grade)
+// MedicineMatcherService — v3
 //
-// Architecture:
-//   • load()              → parses JSON once, pre-builds token index
-//   • parse(ocrText)      → full pipeline: clean → extract → match → score
-//   • cleanText()         → public utility for preprocessing
+// What changed vs v2:
+//   • Pharmaceutical forms are now loaded from
+//     assets/data/formes_pharmaceutiques.json  (no more hardcoded list)
+//   • Form matching uses FUZZY Levenshtein sliding-window search so that
+//     OCR errors (1-2 wrong letters) still find the right form.
+//   • The rest of the pipeline (name matching) is unchanged.
 //
-// Matching strategy:
-//   1. Preprocess OCR text (uppercase, accent-strip, noise removal)
-//   2. Remove manufacturer words, dosage patterns, pharmaceutical forms
-//   3. Build unigram + bigram + trigram token sets from cleaned text
-//   4. Look up candidates via inverted index (fast)
-//   5. Score each candidate: exact token hits + Levenshtein similarity
-//   6. Apply confidence threshold — return null if no confident match
+// Form matching algorithm:
+//   For each phrase in the JSON list:
+//     1. Normalize it (uppercase + accent-strip) — same pipeline as OCR text.
+//     2. Split the OCR text into overlapping windows of the same word-count.
+//     3. Compute Levenshtein similarity between the phrase and each window.
+//     4. Accept the best match if similarity ≥ _formThreshold.
+//   Multi-word phrases (e.g. "COMPRIME PELLICULE") are tried before shorter
+//   ones so they win over a partial single-word match.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class MedicineMatcherService {
@@ -24,23 +27,26 @@ class MedicineMatcherService {
 
   List<String> _names = [];
   Map<String, List<int>> _index = {};
-
-  /// Pre-tokenised medicine names (cached after load for performance)
   final List<List<String>> _nameTokens = [];
+
+  /// Loaded from formes_pharmaceutiques.json:
+  /// List of (normalizedPhrase, displayLabel, wordCount) tuples, sorted
+  /// longest-phrase-first so longer matches win.
+  final List<_FormEntry> _formEntries = [];
 
   bool get isReady => _names.isNotEmpty;
 
   // ── Configuration ──────────────────────────────────────────────────────────
 
-  /// Minimum similarity score [0..1] for a match to be accepted
   static const double _threshold = 0.72;
-
-  /// Minimum confidence [0..1] reported in OcrResult
   static const double _minReportedConfidence = 0.55;
+
+  /// Minimum fuzzy similarity to accept a form match [0..1].
+  /// 0.82 means up to ~2 wrong characters in a typical 12-char word.
+  static const double _formThreshold = 0.82;
 
   // ── Blacklists ────────────────────────────────────────────────────────────
 
-  /// Manufacturer names to strip before matching
   static const Set<String> _manufacturers = {
     'VIATRIS', 'KABI', 'BRAUN', 'MYLAN', 'SANDOZ', 'BIOGARAN', 'TEVA',
     'AGUETTANT', 'LAPROPHAN', 'SOTHEMA', 'NORMON', 'COOPER', 'ISIO',
@@ -53,7 +59,6 @@ class MedicineMatcherService {
     'SUN', 'IVAX', 'PIERRE', 'FABRE',
   };
 
-  /// Pharmaceutical form keywords to strip
   static const Set<String> _forms = {
     'COMPRIME', 'COMPRIMES', 'PELLICULE', 'PELLICULES', 'ENROBE', 'ENROBES',
     'EFFERVESCENT', 'DISPERSIBLE', 'ORODISPERSIBLE', 'SUBLINGUAL', 'SECABLE',
@@ -74,6 +79,7 @@ class MedicineMatcherService {
   // ── Load ──────────────────────────────────────────────────────────────────
 
   Future<void> load() async {
+    // 1. Load medicine index
     final raw = await rootBundle.loadString('assets/data/medicines_index.json');
     final Map<String, dynamic> json = jsonDecode(raw);
 
@@ -84,16 +90,51 @@ class MedicineMatcherService {
       (k, v) => MapEntry(k, List<int>.from(v as List)),
     );
 
-    // Pre-tokenise all medicine names once
     _nameTokens.clear();
     for (final name in _names) {
       _nameTokens.add(_tokenize(cleanText(name)));
     }
 
-    debugPrint('[Matcher] Loaded ${_names.length} medicines.');
+    // 2. Load pharmaceutical forms from JSON
+    await _loadFormEntries();
+
+    debugPrint('[Matcher] Loaded ${_names.length} medicines, ${_formEntries.length} form phrases.');
   }
 
-  // ── Legacy API (kept for ocr_test_page.dart compatibility) ───────────────
+  /// Parses formes_pharmaceutiques.json and builds the sorted _formEntries list.
+  Future<void> _loadFormEntries() async {
+    _formEntries.clear();
+    try {
+      final raw = await rootBundle.loadString('assets/formes_pharmaceutiques.json');
+      final List<dynamic> phrases = jsonDecode(raw) as List<dynamic>;
+
+      for (final phrase in phrases) {
+        final String raw = (phrase as String).trim();
+        if (raw.isEmpty) continue;
+
+        // Normalize the phrase exactly like we normalize OCR text
+        final String normalized = _normalizePlain(raw);
+        if (normalized.isEmpty) continue;
+
+        final int wordCount = normalized.split(RegExp(r'\s+')).length;
+
+        _formEntries.add(_FormEntry(
+          keyword: normalized,
+          display: _toTitleCaseFrench(raw),
+          wordCount: wordCount,
+        ));
+      }
+
+      // Sort: longest phrases first (multi-word beats single-word)
+      _formEntries.sort((a, b) => b.wordCount.compareTo(a.wordCount));
+    } catch (e) {
+      debugPrint('[Matcher] Warning: could not load formes_pharmaceutiques.json — $e');
+      // Fall back to a minimal built-in list so the app doesn't break
+      _formEntries.addAll(_builtinForms());
+    }
+  }
+
+  // ── Legacy API ────────────────────────────────────────────────────────────
 
   Future<void> loadMedicines() => load();
 
@@ -109,23 +150,25 @@ class MedicineMatcherService {
 
   // ── Public entry point ────────────────────────────────────────────────────
 
-  /// Full pipeline: raw OCR text → structured OcrResult
   OcrResult parse(String ocrText) {
-    // 1. Preserve original for debug output
     final String rawText = ocrText;
 
-    // 2. Extract dosage and form BEFORE cleaning (they have specific patterns)
+    // Dosage must be extracted BEFORE digit substitution (0→O, 1→I, 5→S)
+    // because that substitution would turn "125 ml" into "IZS ML" and the
+    // dosage regex (which needs real digits) would find nothing.
+    final String plainNormalized = _normalizePlain(ocrText);
+    final String? dosage = _extractDosage(plainNormalized);
+
+    // Form uses full normalization (digit sub included) — form words never
+    // contain meaningful digits.
     final String normalizedForExtraction = _normalize(ocrText);
-    final String? dosage = _extractDosage(normalizedForExtraction);
     final String? form = _extractForm(normalizedForExtraction);
 
-    // 3. Clean the text for name matching
     final String cleaned = cleanText(ocrText);
     if (cleaned.isEmpty) {
       return OcrResult(rawText: rawText, confidence: 0.0);
     }
 
-    // 4. Build n-gram token set from cleaned OCR
     final List<String> words = _tokenize(cleaned);
     final List<String> ngrams = _buildNgrams(words);
 
@@ -133,10 +176,8 @@ class MedicineMatcherService {
       return OcrResult(rawText: rawText, dosage: dosage, form: form, confidence: 0.0);
     }
 
-    // 5. Find candidates via inverted index
     final Map<int, double> scores = _scoreCandidates(words, ngrams, cleaned);
 
-    // 6. Pick best match above threshold
     if (scores.isEmpty) {
       return OcrResult(rawText: rawText, dosage: dosage, form: form, confidence: 0.0);
     }
@@ -166,22 +207,30 @@ class MedicineMatcherService {
 
   // ── Text Cleaning Pipeline ────────────────────────────────────────────────
 
-  /// Public utility: full preprocessing for a text before matching.
-  /// Steps: uppercase → accent-strip → remove dosage → remove forms →
-  ///        remove manufacturers → strip noise → normalize spaces
   String cleanText(String text) {
-    String t = _normalize(text);       // uppercase + accent strip + special chars
-    t = _removeDosagePatterns(t);      // e.g. 500 MG, 1G/5ML
-    t = _removeBlacklistedWords(t, _forms);         // pharmaceutical forms
-    t = _removeBlacklistedWords(t, _manufacturers); // manufacturer names
-    t = _removeShortNoise(t);          // 1- or 2-char tokens
+    String t = _normalize(text);
+    t = _removeDosagePatterns(t);
+    t = _removeBlacklistedWords(t, _forms);
+    t = _removeBlacklistedWords(t, _manufacturers);
+    t = _removeShortNoise(t);
     t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
     return t;
   }
 
   // ── Normalization ─────────────────────────────────────────────────────────
 
+  /// Full OCR normalization: uppercase + accent-strip + digit substitutions
   String _normalize(String text) {
+    return _normalizePlain(text)
+        // Common OCR digit→letter confusions on medicine boxes
+        .replaceAll('0', 'O')
+        .replaceAll('1', 'I')
+        .replaceAll('5', 'S');
+  }
+
+  /// Plain normalization without digit substitution — used for form phrases
+  /// (form phrases don't have digit confusions so we skip that step)
+  String _normalizePlain(String text) {
     return text
         .toUpperCase()
         .replaceAll('À', 'A').replaceAll('Â', 'A').replaceAll('Ä', 'A')
@@ -191,15 +240,11 @@ class MedicineMatcherService {
         .replaceAll('Ò', 'O').replaceAll('Ó', 'O').replaceAll('Ô', 'O').replaceAll('Õ', 'O').replaceAll('Ö', 'O')
         .replaceAll('Ù', 'U').replaceAll('Ú', 'U').replaceAll('Û', 'U').replaceAll('Ü', 'U')
         .replaceAll('Ç', 'C').replaceAll('Ñ', 'N')
-        // Common OCR digit→letter confusions on medicine boxes
-        .replaceAll('0', 'O').replaceAll('1', 'I').replaceAll('5', 'S')
-        // Strip everything except letters, spaces, hyphens (keep hyphens for multi-word names)
         .replaceAll(RegExp(r'[^A-Z\s\-]'), ' ')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
   }
 
-  /// Remove dosage patterns like "500 MG", "1G", "10MG/ML", "250 MCG"
   String _removeDosagePatterns(String text) {
     return text
         .replaceAll(
@@ -213,13 +258,11 @@ class MedicineMatcherService {
         .trim();
   }
 
-  /// Remove exact blacklisted words (whole-word matching)
   String _removeBlacklistedWords(String text, Set<String> blacklist) {
     final words = text.split(' ');
     return words.where((w) => !blacklist.contains(w)).join(' ');
   }
 
-  /// Remove 1-2 character tokens (OCR noise)
   String _removeShortNoise(String text) {
     final words = text.split(' ');
     return words.where((w) => w.length >= 3).join(' ');
@@ -230,51 +273,37 @@ class MedicineMatcherService {
   List<String> _tokenize(String text) =>
       text.split(RegExp(r'[\s\-]+')).where((w) => w.length >= 3).toList();
 
-  /// Build unigrams + bigrams + trigrams from word list
   List<String> _buildNgrams(List<String> words) {
     final List<String> ngrams = List.from(words);
-
-    // Bigrams
     for (int i = 0; i < words.length - 1; i++) {
       ngrams.add('${words[i]} ${words[i + 1]}');
     }
-
-    // Trigrams
     for (int i = 0; i < words.length - 2; i++) {
       ngrams.add('${words[i]} ${words[i + 1]} ${words[i + 2]}');
     }
-
     return ngrams;
   }
 
   // ── Candidate Scoring ─────────────────────────────────────────────────────
 
-  /// Returns a map of {nameIndex → confidence score}
   Map<int, double> _scoreCandidates(
     List<String> words,
     List<String> ngrams,
     String cleanedFull,
   ) {
-    // Step 1: collect candidate indices via inverted index (fast pre-filter)
     final Map<int, int> hitCount = {};
 
     for (final w in words) {
       if (w.length < 3) continue;
-
-      // Direct lookup
       _addHits(hitCount, _index[w], 2);
-
-      // OCR variants (digit/letter substitutions reversed)
       for (final variant in _ocrVariants(w)) {
         _addHits(hitCount, _index[variant], 1);
       }
     }
 
-    // Also search with bigrams/trigrams in the index
     for (final ng in ngrams) {
       if (ng.contains(' ')) {
         final parts = ng.split(' ');
-        // Intersect candidate sets for multi-word names
         final Set<int>? common = _intersectCandidates(parts);
         if (common != null) {
           for (final idx in common) {
@@ -286,7 +315,6 @@ class MedicineMatcherService {
 
     if (hitCount.isEmpty) return {};
 
-    // Step 2: Take top-30 by hit count, score them with Levenshtein
     final topCandidates = hitCount.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
 
@@ -297,7 +325,6 @@ class MedicineMatcherService {
       final String name = _names[idx];
       final List<String> nameWords = _nameTokens[idx];
 
-      // Fast check: exact substring
       if (cleanedFull.contains(name)) {
         scores[idx] = 1.0;
         continue;
@@ -331,7 +358,6 @@ class MedicineMatcherService {
     }
   }
 
-  /// Multi-signal scoring for a single candidate name against OCR words
   double _computeScore(
     List<String> nameWords,
     List<String> ocrWords,
@@ -350,13 +376,11 @@ class MedicineMatcherService {
 
       for (final ow in ocrWords) {
         if (ow.length < 3) continue;
-
         if (ow == nw) {
           bestSim = 1.0;
           exact = true;
           break;
         }
-
         final double sim = _levenshteinSimilarity(nw, ow);
         if (sim > bestSim) bestSim = sim;
       }
@@ -369,8 +393,6 @@ class MedicineMatcherService {
 
     final double coverage = simSum / significant.length;
     final double exactBonus = exactHits / significant.length * 0.2;
-
-    // Penalise very short names that match common substrings (false positives)
     final double lengthPenalty = name.length < 4 ? 0.5 : 1.0;
 
     return ((coverage + exactBonus) * lengthPenalty).clamp(0.0, 1.0);
@@ -395,53 +417,63 @@ class MedicineMatcherService {
     return match.group(0)!.trim().toUpperCase();
   }
 
-  // ── Form Extraction ───────────────────────────────────────────────────────
+  // ── Form Extraction — FUZZY ───────────────────────────────────────────────
+  //
+  // Strategy:
+  //   For each form phrase (sorted longest-first so specific wins):
+  //     • Build every consecutive word-window of the same length from OCR text
+  //     • Compare phrase vs window with Levenshtein similarity
+  //     • Also try exact substring match (fast path)
+  //   Accept first phrase whose best window score ≥ _formThreshold.
+  //
+  // Why sliding window and not whole-text similarity?
+  //   The form word(s) appear somewhere inside a longer OCR text.
+  //   Comparing the full text would dilute the score badly.
+  // ──────────────────────────────────────────────────────────────────────────
 
-  static const List<_FormEntry> _formEntries = [
-    _FormEntry('INJECTABLE', 'Injectable'),
-    _FormEntry('PERFUSION', 'Perfusion'),
-    _FormEntry('SERINGUE', 'Seringue pré-remplie'),
-    _FormEntry('LYOPHILISAT', 'Lyophilisat'),
-    _FormEntry('COMPRIME EFFERVESCENT', 'Comprimé effervescent'),
-    _FormEntry('COMPRIME DISPERSIBLE', 'Comprimé dispersible'),
-    _FormEntry('COMPRIME ORODISPERSIBLE', 'Comprimé orodispersible'),
-    _FormEntry('COMPRIME SUBLINGUAL', 'Comprimé sublingual'),
-    _FormEntry('COMPRIME A CROQUER', 'Comprimé à croquer'),
-    _FormEntry('COMPRIME A LIBERATION', 'Comprimé LP'),
-    _FormEntry('COMPRIME GASTRO', 'Comprimé gastro-résistant'),
-    _FormEntry('COMPRIMES PELLICULES', 'Comprimé pelliculé'),
-    _FormEntry('COMPRIME PELLICULE', 'Comprimé pelliculé'),
-    _FormEntry('COMPRIME SECABLE', 'Comprimé sécable'),
-    _FormEntry('COMPRIME ENROBE', 'Comprimé enrobé'),
-    _FormEntry('COMPRIME', 'Comprimé'),
-    _FormEntry('GELULE A LIBERATION', 'Gélule LP'),
-    _FormEntry('GELULE GASTRO', 'Gélule gastro-résistante'),
-    _FormEntry('GELULE', 'Gélule'),
-    _FormEntry('CAPSULE MOLLE', 'Capsule molle'),
-    _FormEntry('CAPSULE', 'Capsule'),
-    _FormEntry('SIROP', 'Sirop'),
-    _FormEntry('SUSPENSION BUVABLE', 'Suspension buvable'),
-    _FormEntry('SOLUTION BUVABLE', 'Solution buvable'),
-    _FormEntry('POUDRE POUR SUSPENSION', 'Poudre susp. buvable'),
-    _FormEntry('SACHET', 'Sachet'),
-    _FormEntry('GRANULE', 'Granulé'),
-    _FormEntry('CREME', 'Crème'),
-    _FormEntry('POMMADE', 'Pommade'),
-    _FormEntry('LOTION', 'Lotion'),
-    _FormEntry('PATCH', 'Patch transdermique'),
-    _FormEntry('AEROSOL', 'Aérosol / Inhaler'),
-    _FormEntry('INHALATION', 'Inhalation'),
-    _FormEntry('COLLYRE', 'Collyre'),
-    _FormEntry('AEROSOL NASAL', 'Spray nasal'),
-    _FormEntry('SUPPOSITOIRE', 'Suppositoire'),
-    _FormEntry('OVULE', 'Ovule vaginal'),
-  ];
+  String? _extractForm(String normalizedOcrText) {
+    if (_formEntries.isEmpty) return null;
 
-  String? _extractForm(String text) {
+    // Split OCR into words once
+    final List<String> ocrWords =
+        normalizedOcrText.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+    if (ocrWords.isEmpty) return null;
+
+    String? bestDisplay;
+    double bestScore = 0.0;
+    int bestWordCount = 0; // prefer longer phrases when scores are equal
+
     for (final entry in _formEntries) {
-      if (text.contains(entry.keyword)) return entry.display;
+      final String phrase = entry.keyword; // already normalized
+      final int wc = entry.wordCount;
+
+      if (ocrWords.length < wc) continue;
+
+      double phraseScore = 0.0;
+
+      // ── Sliding window: compare phrase against every wc-word window ────────
+      // Word-level windows prevent "GEL" from matching inside "GELULES".
+      // Handles both exact (score=1.0) and fuzzy matches uniformly.
+      for (int i = 0; i <= ocrWords.length - wc; i++) {
+        final String window = ocrWords.sublist(i, i + wc).join(' ');
+        final double sim = _levenshteinSimilarity(phrase, window);
+        if (sim > phraseScore) phraseScore = sim;
+        if (phraseScore == 1.0) break; // can't do better
+      }
+
+      // Accept if above threshold AND (better score OR same score but longer phrase)
+      if (phraseScore >= _formThreshold) {
+        if (phraseScore > bestScore ||
+            (phraseScore == bestScore && wc > bestWordCount)) {
+          bestScore = phraseScore;
+          bestDisplay = entry.display;
+          bestWordCount = wc;
+          debugPrint('[Form] Match: "${entry.display}" score=${phraseScore.toStringAsFixed(3)}');
+        }
+      }
     }
-    return null;
+
+    return bestDisplay;
   }
 
   // ── OCR Variant Generation ────────────────────────────────────────────────
@@ -451,7 +483,6 @@ class MedicineMatcherService {
     if (word.contains('O')) variants.add(word.replaceAll('O', '0'));
     if (word.contains('I')) variants.add(word.replaceAll('I', '1'));
     if (word.contains('S')) variants.add(word.replaceAll('S', '5'));
-    // Reverse substitutions: maybe OCR read a digit as a letter
     if (word.contains('0')) variants.add(word.replaceAll('0', 'O'));
     if (word.contains('1')) variants.add(word.replaceAll('1', 'I'));
     return variants;
@@ -464,7 +495,6 @@ class MedicineMatcherService {
     if (a.isEmpty || b.isEmpty) return 0.0;
 
     final int la = a.length, lb = b.length;
-    // Quick length filter
     if ((la - lb).abs() > (la > lb ? la : lb) * 0.45) return 0.0;
 
     List<int> prev = List.generate(lb + 1, (j) => j);
@@ -481,13 +511,39 @@ class MedicineMatcherService {
                   .reduce((x, y) => x < y ? x : y);
         }
       }
-      final tmp = prev; prev = curr; curr = tmp;
+      final tmp = prev;
+      prev = curr;
+      curr = tmp;
     }
 
     final dist = prev[lb];
     final maxLen = la > lb ? la : lb;
     return 1.0 - dist / maxLen;
   }
+
+  // ── Title-case helper for display labels ─────────────────────────────────
+
+  String _toTitleCaseFrench(String text) {
+    // Keep the original capitalisation from the JSON (it's already good French)
+    // Just capitalise the very first letter in case it's lowercase.
+    if (text.isEmpty) return text;
+    return '${text[0].toUpperCase()}${text.substring(1)}';
+  }
+
+  // ── Built-in fallback forms (used if JSON fails to load) ─────────────────
+
+  List<_FormEntry> _builtinForms() => [
+    _FormEntry(keyword: 'INJECTABLE', display: 'Injectable', wordCount: 1),
+    _FormEntry(keyword: 'COMPRIME', display: 'Comprimé', wordCount: 1),
+    _FormEntry(keyword: 'GELULE', display: 'Gélule', wordCount: 1),
+    _FormEntry(keyword: 'SIROP', display: 'Sirop', wordCount: 1),
+    _FormEntry(keyword: 'SOLUTION', display: 'Solution', wordCount: 1),
+    _FormEntry(keyword: 'POMMADE', display: 'Pommade', wordCount: 1),
+    _FormEntry(keyword: 'CAPSULE', display: 'Capsule', wordCount: 1),
+    _FormEntry(keyword: 'SUPPOSITOIRE', display: 'Suppositoire', wordCount: 1),
+    _FormEntry(keyword: 'COLLYRE', display: 'Collyre', wordCount: 1),
+    _FormEntry(keyword: 'PATCH', display: 'Patch', wordCount: 1),
+  ];
 
   // ── Debug helper ──────────────────────────────────────────────────────────
 
@@ -498,7 +554,7 @@ class MedicineMatcherService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Legacy shim — keeps ocr_test_page.dart compiling without changes
+// Legacy shim
 // ─────────────────────────────────────────────────────────────────────────────
 
 class OcrMedicineLegacy {
@@ -512,11 +568,16 @@ class OcrMedicineLegacy {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
+// Internal helper
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _FormEntry {
-  final String keyword;
-  final String display;
-  const _FormEntry(this.keyword, this.display);
+  final String keyword;   // normalized (uppercase, accent-stripped)
+  final String display;   // human-readable label to show in UI
+  final int wordCount;    // number of words in the phrase
+  const _FormEntry({
+    required this.keyword,
+    required this.display,
+    required this.wordCount,
+  });
 }

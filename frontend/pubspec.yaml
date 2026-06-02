@@ -67,3 +67,4 @@ flutter:
     - assets/authlogo.png
     - assets/data/medicines.json
     - assets/data/medicines_index.json
+    - assets/formes_pharmaceutiques.json
