@@ -34,6 +34,10 @@ class MedicineMatcherService {
   /// longest-phrase-first so longer matches win.
   final List<_FormEntry> _formEntries = [];
 
+  /// Loaded from dosage_complet.json (values_with_units list):
+  /// Sorted longest-phrase-first for greedy matching.
+  final List<_DosageEntry> _dosageEntries = [];
+
   bool get isReady => _names.isNotEmpty;
 
   // ── Configuration ──────────────────────────────────────────────────────────
@@ -98,7 +102,10 @@ class MedicineMatcherService {
     // 2. Load pharmaceutical forms from JSON
     await _loadFormEntries();
 
-    debugPrint('[Matcher] Loaded ${_names.length} medicines, ${_formEntries.length} form phrases.');
+    // 3. Load dosage patterns from JSON
+    await _loadDosageEntries();
+
+    debugPrint('[Matcher] Loaded ${_names.length} medicines, ${_formEntries.length} form phrases, ${_dosageEntries.length} dosage patterns.');
   }
 
   /// Parses formes_pharmaceutiques.json and builds the sorted _formEntries list.
@@ -134,6 +141,45 @@ class MedicineMatcherService {
     }
   }
 
+  /// Parses dosage_complet.json and builds the sorted _dosageEntries list.
+  /// Only the "values_with_units" array is used for matching.
+  Future<void> _loadDosageEntries() async {
+    _dosageEntries.clear();
+    try {
+      final raw = await rootBundle.loadString('assets/dosage_complet.json');
+      final Map<String, dynamic> jsonMap = jsonDecode(raw);
+
+      final List<dynamic> values =
+          (jsonMap['values_with_units'] as List<dynamic>? ?? []);
+
+      for (final v in values) {
+        final String original = (v as String).trim();
+        if (original.isEmpty) continue;
+
+        // Normalize: keep digits, letters, common dosage symbols
+        final String normalized = _normalizeDosage(original);
+        if (normalized.isEmpty) continue;
+
+        final int wc = normalized.split(RegExp(r'\s+')).length;
+
+        _dosageEntries.add(_DosageEntry(
+          keyword: normalized,
+          display: original,
+          wordCount: wc,
+        ));
+      }
+
+      // Sort longest-first so "500 MG / 5 ML" wins over "500 MG"
+      _dosageEntries.sort((a, b) {
+        final lenCmp = b.keyword.length.compareTo(a.keyword.length);
+        return lenCmp != 0 ? lenCmp : b.wordCount.compareTo(a.wordCount);
+      });
+    } catch (e) {
+      debugPrint('[Matcher] Warning: could not load dosage_complet.json — $e');
+      // App keeps working; _extractDosage falls back to regex only.
+    }
+  }
+
   // ── Legacy API ────────────────────────────────────────────────────────────
 
   Future<void> loadMedicines() => load();
@@ -153,11 +199,10 @@ class MedicineMatcherService {
   OcrResult parse(String ocrText) {
     final String rawText = ocrText;
 
-    // Dosage must be extracted BEFORE digit substitution (0→O, 1→I, 5→S)
-    // because that substitution would turn "125 ml" into "IZS ML" and the
-    // dosage regex (which needs real digits) would find nothing.
-    final String plainNormalized = _normalizePlain(ocrText);
-    final String? dosage = _extractDosage(plainNormalized);
+    // Dosage: pass the raw OCR text — _extractDosage normalises internally
+    // using _normalizeDosage (which keeps digits) for JSON matching, and
+    // falls back to _normalizePlain for the regex pass.
+    final String? dosage = _extractDosage(ocrText);
 
     // Form uses full normalization (digit sub included) — form words never
     // contain meaningful digits.
@@ -398,21 +443,97 @@ class MedicineMatcherService {
     return ((coverage + exactBonus) * lengthPenalty).clamp(0.0, 1.0);
   }
 
-  // ── Dosage Extraction ─────────────────────────────────────────────────────
+  // ── Dosage Extraction — JSON-powered with regex fallback ─────────────────
+  //
+  // Strategy (two-pass):
+  //   Pass 1 — JSON values_with_units (fuzzy sliding-window):
+  //     Normalize the OCR text with _normalizeDosage (keeps digits + units),
+  //     then slide a word-window of the same size as each dosage pattern over
+  //     the OCR words. Accept the best match above _dosageThreshold.
+  //     Longest patterns are tried first so "500 MG / 5 ML" beats "500 MG".
+  //   Pass 2 — Regex fallback:
+  //     If JSON pass found nothing, fall back to the original numeric regex.
+  // ────────────────────────────────────────────────────────────────────────
+
+  static const double _dosageThreshold = 0.88;
+
+  static final RegExp _dosageKeepChars = RegExp(r'[^A-Z0-9\s\.,%/\+]');
+
+  /// Normalize a string for dosage matching — keeps digits and dosage symbols.
+  String _normalizeDosage(String text) {
+    return text
+        .toUpperCase()
+        .replaceAll('À', 'A').replaceAll('Â', 'A').replaceAll('Ä', 'A')
+        .replaceAll('Á', 'A').replaceAll('Ã', 'A')
+        .replaceAll('È', 'E').replaceAll('É', 'E').replaceAll('Ê', 'E').replaceAll('Ë', 'E')
+        .replaceAll('Ì', 'I').replaceAll('Í', 'I').replaceAll('Î', 'I').replaceAll('Ï', 'I')
+        .replaceAll('Ò', 'O').replaceAll('Ó', 'O').replaceAll('Ô', 'O').replaceAll('Õ', 'O').replaceAll('Ö', 'O')
+        .replaceAll('Ù', 'U').replaceAll('Ú', 'U').replaceAll('Û', 'U').replaceAll('Ü', 'U')
+        .replaceAll('Ç', 'C').replaceAll('Ñ', 'N')
+        .replaceAll('µ', 'MCG')
+        .replaceAll(_dosageKeepChars, ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  String? _extractDosage(String rawOcrText) {
+    // Pass 1 — JSON-powered fuzzy matching
+    if (_dosageEntries.isNotEmpty) {
+      final String normalizedOcr = _normalizeDosage(rawOcrText);
+      final List<String> ocrWords = normalizedOcr
+          .split(RegExp(r'\s+'))
+          .where((w) => w.isNotEmpty)
+          .toList();
+
+      String? bestDisplay;
+      double bestScore = 0.0;
+      int bestLen = 0;
+
+      for (final entry in _dosageEntries) {
+        final int wc = entry.wordCount;
+        if (ocrWords.length < wc) continue;
+
+        double phraseScore = 0.0;
+
+        for (int i = 0; i <= ocrWords.length - wc; i++) {
+          final String window = ocrWords.sublist(i, i + wc).join(' ');
+          final double sim = _levenshteinSimilarity(entry.keyword, window);
+          if (sim > phraseScore) phraseScore = sim;
+          if (phraseScore == 1.0) break;
+        }
+
+        if (phraseScore >= _dosageThreshold) {
+          if (entry.keyword.length > bestLen ||
+              (entry.keyword.length == bestLen && phraseScore > bestScore)) {
+            bestScore = phraseScore;
+            bestDisplay = entry.display;
+            bestLen = entry.keyword.length;
+            debugPrint('[Dosage] Match: "${entry.display}" score=${phraseScore.toStringAsFixed(3)}');
+          }
+        }
+      }
+
+      if (bestDisplay != null) return bestDisplay;
+    }
+
+    // Pass 2 — Regex fallback
+    return _extractDosageRegex(rawOcrText);
+  }
 
   static const List<String> _dosageUnits = [
     'MBQ', 'GBQ', 'NMOL', 'MMOL', 'MUI', 'MCG',
     'MG/ML', 'MG/G', 'G/ML', 'UI/ML',
-    'MG', 'ML', 'UI', 'IE', 'UG', 'G', '%',
+    'MG', 'ML', 'UI', 'IE', 'UG', 'GR', 'G', '%',
   ];
 
-  String? _extractDosage(String text) {
+  String? _extractDosageRegex(String text) {
+    final String normalized = _normalizePlain(text);
     final unitPattern = _dosageUnits.map(RegExp.escape).join('|');
     final re = RegExp(
       r'(\d[\d,\.]*\s*(?:' + unitPattern + r')(?:\s*/\s*\d[\d,\.]*\s*(?:' + unitPattern + r'))*)',
       caseSensitive: false,
     );
-    final match = re.firstMatch(text);
+    final match = re.firstMatch(normalized);
     if (match == null) return null;
     return match.group(0)!.trim().toUpperCase();
   }
@@ -568,7 +689,7 @@ class OcrMedicineLegacy {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helper
+// Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _FormEntry {
@@ -576,6 +697,17 @@ class _FormEntry {
   final String display;   // human-readable label to show in UI
   final int wordCount;    // number of words in the phrase
   const _FormEntry({
+    required this.keyword,
+    required this.display,
+    required this.wordCount,
+  });
+}
+
+class _DosageEntry {
+  final String keyword;   // normalized version for matching
+  final String display;   // original string to display
+  final int wordCount;    // number of tokens in the phrase
+  const _DosageEntry({
     required this.keyword,
     required this.display,
     required this.wordCount,
