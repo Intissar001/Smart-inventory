@@ -2,9 +2,12 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:path_provider/path_provider.dart';
+
+import 'image_preprocessor.dart';   // ← the new file
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal: word + its visual size score
@@ -39,22 +42,23 @@ class OcrRawResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OCR Service — v4
+// OCR Service — v5
 //
-// Strategy for finding the brand name:
-//   1. Extract EVERY text element with its bounding box.
-//   2. Use cornerPoints to compute the TRUE height of each element
-//      (avoids ML Kit returning identical Rect heights for a whole line).
-//   3. Also compute area (width × height) as tiebreaker.
-//   4. Sort all entries by score = height * 1000 + area  →  pure argmax.
-//   5. The top entry is the visually dominant word = brand name.
-//
-// Additionally: also try LINE-level bboxes for single-word lines,
-// because sometimes ML Kit gives better boxes at line level.
+// Changes vs v4:
+//   • processBytesRich() and processBytes() now run ImagePreprocessor.process()
+//     before passing the image to ML Kit.
+//   • Preprocessing is skipped for very large images (> kMaxPreprocessArea px²)
+//     where the original is already high-resolution — we'd only waste time.
+//   • A PreprocessResult diagnostic is printed at debug level.
+//   • All existing logic (cornerPoints, line-level fallback, deduplication) is
+//     preserved unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
 class OCRService {
   static final TextRecognizer _recognizer = TextRecognizer();
 
+  // Skip preprocessing for images whose area exceeds this.
+  // 1200×900 = 1 080 000 → already high-res, ML Kit will do fine.
+static const int _kMaxPreprocessArea = 1080000;
   // ── Legacy ────────────────────────────────────────────────────────────────
   Future<File> getImageFileFromAssets(String path) async {
     final byteData = await rootBundle.load(path);
@@ -71,22 +75,78 @@ class OCRService {
   }
 
   // ── Main entry ────────────────────────────────────────────────────────────
+
+  /// Rich entry point used by ScanResultsScreen.
+  /// Applies preprocessing before ML Kit if the crop is small or degraded.
   Future<OcrRawResult> processBytesRich(Uint8List bytes,
       {String tag = 'crop'}) async {
+    final Uint8List processedBytes = await _maybePreprocess(bytes, tag: tag);
+
     final tempDir = await getTemporaryDirectory();
     final file = File(
         '${tempDir.path}/ocr_${tag}_${DateTime.now().microsecondsSinceEpoch}.jpeg');
-    await file.writeAsBytes(bytes, flush: true);
+    await file.writeAsBytes(processedBytes, flush: true);
     try {
       return await _runOnFile(file);
     } finally {
-      try { await file.delete(); } catch (_) {}
+      try {
+        await file.delete();
+      } catch (_) {}
     }
   }
 
   Future<String> processBytes(Uint8List bytes, {String tag = 'crop'}) async {
     final r = await processBytesRich(bytes, tag: tag);
     return r.fullText;
+  }
+
+  // ── Preprocessing gate ────────────────────────────────────────────────────
+
+  /// Runs ImagePreprocessor.process() unless the image is already large.
+  /// Returns the (possibly enhanced) bytes to feed to ML Kit.
+  Future<Uint8List> _maybePreprocess(Uint8List bytes, {String tag = 'crop'}) async {
+    // Quick size check from JPEG SOF0 header (avoids full decode)
+    final _QuickSize? qs = _quickJpegSize(bytes);
+    if (qs != null) {
+      final int area = qs.width * qs.height;
+      if (area > _kMaxPreprocessArea) {
+        debugPrint('[OCR-$tag] Skipping preprocess — image already large '
+            '(${qs.width}×${qs.height}, area=$area)');
+        return bytes;
+      }
+    }
+
+    try {
+      final PreprocessResult result = await ImagePreprocessor.process(bytes);
+      debugPrint('[OCR-$tag] $result');
+      return result.bytes;
+    } catch (e) {
+      debugPrint('[OCR-$tag] Preprocessor error: $e — using original bytes');
+      return bytes;
+    }
+  }
+
+  /// Reads width/height from a JPEG SOF0 marker without full decode.
+  /// Returns null if the bytes are not a recognisable JPEG or SOF0 is absent.
+  _QuickSize? _quickJpegSize(Uint8List bytes) {
+    try {
+      int i = 2; // skip SOI (FFD8)
+      while (i < bytes.length - 3) {
+        if (bytes[i] != 0xFF) break;
+        final int marker = bytes[i + 1];
+        final int segLen = (bytes[i + 2] << 8) | bytes[i + 3];
+        if (marker == 0xC0 || marker == 0xC2) {
+          // SOF0 / SOF2 — height at +5, width at +7
+          if (i + 8 < bytes.length) {
+            final int h = (bytes[i + 5] << 8) | bytes[i + 6];
+            final int w = (bytes[i + 7] << 8) | bytes[i + 8];
+            return _QuickSize(w, h);
+          }
+        }
+        i += 2 + segLen;
+      }
+    } catch (_) {}
+    return null;
   }
 
   // ── Core ──────────────────────────────────────────────────────────────────
@@ -116,15 +176,15 @@ class OCRService {
           // cornerPoints = [topLeft, topRight, bottomRight, bottomLeft]
           final pts = element.cornerPoints;
           double elHeight = 0;
-          double elWidth  = 0;
+          double elWidth = 0;
 
           if (pts != null && pts.length == 4) {
             // Height = average of left-side height and right-side height
-            final leftH  = _dist(pts[0], pts[3]);
+            final leftH = _dist(pts[0], pts[3]);
             final rightH = _dist(pts[1], pts[2]);
             elHeight = (leftH + rightH) / 2;
             // Width = average of top-side width and bottom-side width
-            final topW    = _dist(pts[0], pts[1]);
+            final topW = _dist(pts[0], pts[1]);
             final bottomW = _dist(pts[3], pts[2]);
             elWidth = (topW + bottomW) / 2;
           } else {
@@ -132,7 +192,7 @@ class OCRService {
             final bbox = element.boundingBox;
             if (bbox != null) {
               elHeight = bbox.height.toDouble();
-              elWidth  = bbox.width.toDouble();
+              elWidth = bbox.width.toDouble();
             }
           }
 
@@ -184,9 +244,11 @@ class OCRService {
     entries.sort((a, b) => b.score.compareTo(a.score));
 
     // Debug: print top-5
-    final top5 = entries.take(5).map(
-      (e) => '"${e.word}" h=${e.height.toStringAsFixed(1)} a=${e.area.toStringAsFixed(0)}'
-    ).toList();
+    final top5 = entries
+        .take(5)
+        .map((e) =>
+            '"${e.word}" h=${e.height.toStringAsFixed(1)} a=${e.area.toStringAsFixed(0)}')
+        .toList();
     // ignore: avoid_print
     print('[OCR] TOP-5 by size: ${top5.join(' | ')}');
 
@@ -244,7 +306,8 @@ class OCRService {
       for (final existing in result) {
         final String en = existing.toUpperCase().trim();
         if (en == n || (n.length > 4 && (en.contains(n) || n.contains(en)))) {
-          dup = true; break;
+          dup = true;
+          break;
         }
       }
       if (!dup) result.add(line);
@@ -255,12 +318,23 @@ class OCRService {
   String _toTitleCase(String text) {
     if (text.isEmpty) return text;
     if (text == text.toUpperCase()) {
-      return text.split(' ').map((w) => w.isEmpty
-          ? '' : '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}')
+      return text
+          .split(' ')
+          .map((w) =>
+              w.isEmpty ? '' : '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}')
           .join(' ');
     }
     return text;
   }
 
   static void disposeRecognizer() => _recognizer.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helper
+// ─────────────────────────────────────────────────────────────────────────────
+class _QuickSize {
+  final int width;
+  final int height;
+  const _QuickSize(this.width, this.height);
 }

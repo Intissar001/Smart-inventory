@@ -95,7 +95,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   late AnimationController _pulseController;
 
-  static const String _backendUrl = "http://192.168.1.2:8000/detect";
+  static const String _backendUrl = "http://192.168.1.6:8000/detect";
 
   @override
   void initState() {
@@ -990,9 +990,83 @@ class _AnnotationEditorScreenState extends State<AnnotationEditorScreen> {
   }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Scan Results Screen
-// Shows per-box crops + total count + shelf editor
+// Scan Results Screen — v3
+//
+// Architecture:
+//   • ONE list of _MedicineRow objects drives everything.
+//     Each row = one line in the summary table (name + form + dosage + count).
+//   • Rows come from two sources:
+//       – Auto-created by OCR grouping when results arrive.
+//       – Manually added by the user (empty or inheriting parent name).
+//   • Grouping is LIVE: after any edit or add, rows with identical
+//     normalised(name+form+dosage) are automatically merged into one display
+//     card with their counts summed.  Merging is display-only — the raw rows
+//     are preserved so the user can split them back.
+//
+// "Add from parent" button (inside a card):
+//   – Creates a new row with name = parent name, form = "", dosage = "".
+//   – Parent card count decrements by 1 automatically (min 0).
+//
+// "Add empty row" card (last card in list):
+//   – Creates a fully empty row (name="", form="", dosage="", count=1).
+//   – No automatic decrement anywhere.
+//
+// Edit sheet:
+//   – Inline bottom sheet per card (not per raw row) that lets the user
+//     change name / form / dosage and the count for that display group.
+//   – After save, the raw rows that belong to the edited group are updated.
+//
+// Confirm button shows the live grand total.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Raw row model ─────────────────────────────────────────────────────────────
+
+class _MedicineRow {
+  static int _idCounter = 0;
+
+  final int id;          // stable identity
+  String name;
+  String form;
+  String dosage;
+  int count;             // contribution of this raw row to its display group
+
+  _MedicineRow({
+    required this.name,
+    required this.form,
+    required this.dosage,
+    required this.count,
+  }) : id = ++_idCounter;
+
+  /// Normalised key used to group rows together.
+  String get groupKey {
+    String n(String s) =>
+        s.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+    return '${n(name)}||${n(form)}||${n(dosage)}';
+  }
+}
+
+// ── Display-group model (derived, never stored) ───────────────────────────────
+
+class _DisplayGroup {
+  final String key;
+  final String name;
+  final String form;
+  final String dosage;
+  final int totalCount;
+  final List<_MedicineRow> rows; // raw rows that belong to this group
+
+  const _DisplayGroup({
+    required this.key,
+    required this.name,
+    required this.form,
+    required this.dosage,
+    required this.totalCount,
+    required this.rows,
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 class ScanResultsScreen extends StatefulWidget {
@@ -1019,37 +1093,92 @@ class ScanResultsScreen extends StatefulWidget {
 
 class _ScanResultsScreenState extends State<ScanResultsScreen>
     with TickerProviderStateMixin {
-  late int _count;
+
+  // ── Shelf ─────────────────────────────────────────────────────────────────
   String _shelfName = "Shelf A";
   bool _isEditingShelf = false;
   final TextEditingController _shelfCtrl = TextEditingController();
 
+  // ── Success animation ────────────────────────────────────────────────────
   bool _showSuccess = false;
   late AnimationController _successAnim;
   late Animation<Offset> _slideAnim;
 
-  // Crops fetched from /crop endpoint — key = box.id
-  final Map<int, Uint8List?> _crops = {};
+  // ── OCR infrastructure ────────────────────────────────────────────────────
   bool _loadingCrops = false;
-
-  // OCR results — key = box.id
-  final Map<int, OcrResult?> _ocrResults = {};
-
+  final Map<int, OcrResult?> _ocrResults = {}; // boxId → OCR
   final OCRService _ocrService = OCRService();
   final MedicineMatcherService _matcher = MedicineMatcherService();
+
+  // ── The single source of truth ────────────────────────────────────────────
+  // One _MedicineRow per detected box, seeded empty then filled by OCR.
+  // The user can also add extra rows manually.
+  final List<_MedicineRow> _rows = [];
+
+  // boxId → rowId  (so OCR can update the right row when it finishes)
+  final Map<int, int> _boxToRow = {};
+
+  // ── Colour palette for group cards ───────────────────────────────────────
+  static const List<Color> _palette = [
+    Color(0xFF6366F1), Color(0xFF14B8A6), Color(0xFFF59E0B), Color(0xFFEF4444),
+    Color(0xFF10B981), Color(0xFF3B82F6), Color(0xFFEC4899), Color(0xFF8B5CF6),
+    Color(0xFFF97316), Color(0xFF06B6D4),
+  ];
+  final Map<String, int> _groupColorIdx = {};
+  int _nextColorIdx = 0;
+
+  // ── Derived display groups ────────────────────────────────────────────────
+  List<_DisplayGroup> get _groups {
+    final Map<String, List<_MedicineRow>> buckets = {};
+    for (final r in _rows) {
+      buckets.putIfAbsent(r.groupKey, () => []).add(r);
+    }
+    // Assign palette indices for new keys
+    for (final key in buckets.keys) {
+      if (!_groupColorIdx.containsKey(key)) {
+        _groupColorIdx[key] = _nextColorIdx % _palette.length;
+        _nextColorIdx++;
+      }
+    }
+    return buckets.entries.map((e) {
+      final rep = e.value.first;
+      return _DisplayGroup(
+        key: e.key,
+        name: rep.name,
+        form: rep.form,
+        dosage: rep.dosage,
+        totalCount: e.value.fold(0, (s, r) => s + r.count),
+        rows: e.value,
+      );
+    }).toList();
+  }
+
+  Color _colorForKey(String key) {
+    final idx = _groupColorIdx[key] ?? 0;
+    return _palette[idx % _palette.length];
+  }
+
+  int get _grandTotal => _rows.fold(0, (s, r) => s + r.count);
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _count = widget.detectedBoxes.length;
     _shelfCtrl.text = _shelfName;
 
     _successAnim = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 600));
-    _slideAnim = Tween<Offset>(
-            begin: const Offset(0, 1.5), end: Offset.zero)
-        .animate(
+    _slideAnim =
+        Tween<Offset>(begin: const Offset(0, 1.5), end: Offset.zero).animate(
             CurvedAnimation(parent: _successAnim, curve: Curves.elasticOut));
+
+    // Create one placeholder row per detected box
+    for (final b in widget.detectedBoxes) {
+      final row = _MedicineRow(name: '', form: '', dosage: '', count: 1);
+      _rows.add(row);
+      _boxToRow[b.id] = row.id;
+    }
 
     _loadMatcherAndFetchCrops();
   }
@@ -1062,77 +1191,219 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
     super.dispose();
   }
 
-  // ── Load medicine list, then fetch crops + run OCR ───────────────────────
+  // ── OCR pipeline ──────────────────────────────────────────────────────────
 
   Future<void> _loadMatcherAndFetchCrops() async {
-    try {
-      await _matcher.load();
-    } catch (e) {
-      debugPrint("MedicineMatcherService load error: $e");
+    try { await _matcher.load(); } catch (e) {
+      debugPrint("Matcher load error: $e");
     }
     await _fetchCrops();
   }
 
   Future<void> _fetchCrops() async {
-    setState(() => _loadingCrops = true);
+    if (mounted) setState(() => _loadingCrops = true);
     for (final box in widget.detectedBoxes) {
       try {
         final request = http.MultipartRequest(
-          'POST',
-          Uri.parse("${widget.backendBase}/crop"),
-        );
+          'POST', Uri.parse("${widget.backendBase}/crop"));
         request.files.add(
             await http.MultipartFile.fromPath('file', widget.imageFile.path));
-        request.fields['bbox'] =
-            jsonEncode([box.x1.round(), box.y1.round(), box.x2.round(), box.y2.round()]);
+        request.fields['bbox'] = jsonEncode([
+          box.x1.round(), box.y1.round(), box.x2.round(), box.y2.round()]);
         request.fields['padding'] = '6';
 
         final resp = await request.send();
         if (resp.statusCode == 200) {
           final bytes = await resp.stream.toBytes();
-          if (mounted) {
-            setState(() => _crops[box.id] = bytes);
-          }
-          // Run OCR on this crop in the background
           _runOcrOnCrop(box.id, bytes);
-        } else {
-          if (mounted) setState(() => _crops[box.id] = null);
         }
       } catch (e) {
-        debugPrint("Crop error for box ${box.id}: $e");
-        if (mounted) setState(() => _crops[box.id] = null);
+        debugPrint("Crop error box ${box.id}: $e");
       }
     }
     if (mounted) setState(() => _loadingCrops = false);
   }
 
-  // ── Run ML Kit OCR on a single crop, then parse name/form/dosage ──────────
-
   Future<void> _runOcrOnCrop(int boxId, Uint8List bytes) async {
     try {
-      // Get raw OCR text + largest visual word from ML Kit
-      final OcrRawResult raw =
-          await _ocrService.processBytesRich(bytes, tag: 'box_$boxId');
-
-      // Run the matcher to extract form and dosage.
-      // Name matching (DB lookup) stays disabled — we keep matchedName: null
-      // and fall back to the largest visual text for display, exactly as before.
-      final OcrResult parsed = _matcher.parse(raw.fullText);
-
-      final OcrResult result = OcrResult(
-        matchedName: null,          // DB name matching intentionally off
-        form: parsed.form,          // ← form extracted from OCR text
-        dosage: parsed.dosage,      // ← dosage extracted from OCR text
+      final raw = await _ocrService.processBytesRich(bytes, tag: 'box_$boxId');
+      final parsed = _matcher.parse(raw.fullText);
+      final result = OcrResult(
+        matchedName: null,
+        form: parsed.form,
+        dosage: parsed.dosage,
         rawText: raw.fullText,
         confidence: 0.0,
         largestText: raw.largestText,
       );
-
-      if (mounted) setState(() => _ocrResults[boxId] = result);
+      if (mounted) {
+        setState(() {
+          _ocrResults[boxId] = result;
+          final rowId = _boxToRow[boxId];
+          final idx = _rows.indexWhere((r) => r.id == rowId);
+          if (idx != -1 && _rows[idx].name.isEmpty) {
+            // Only update if the user hasn't already edited this row
+            _rows[idx].name   = result.displayName ?? '';
+            _rows[idx].form   = result.form ?? '';
+            _rows[idx].dosage = result.dosage ?? '';
+          }
+        });
+      }
     } catch (e) {
-      debugPrint("OCR error for box $boxId: $e");
-      if (mounted) setState(() => _ocrResults[boxId] = null);
+      debugPrint("OCR error box $boxId: $e");
     }
+  }
+
+  // ── Row mutations ─────────────────────────────────────────────────────────
+
+  /// Add an empty row (global "+" at bottom of list)
+  void _addEmptyRow() {
+    setState(() {
+      _rows.add(_MedicineRow(name: '', form: '', dosage: '', count: 1));
+    });
+  }
+
+  /// Add an empty row AND immediately open the edit sheet.
+  /// Used by the footer of "no-name" cards so the user fills details right away.
+  Future<void> _addEmptyRowWithEdit() async {
+    final newRow = _MedicineRow(name: '', form: '', dosage: '', count: 1);
+    setState(() => _rows.add(newRow));
+
+    if (!mounted) return;
+    final group = _DisplayGroup(
+      key: newRow.groupKey,
+      name: '', form: '', dosage: '',
+      totalCount: 1,
+      rows: [newRow],
+    );
+
+    final result = await showModalBottomSheet<_GroupEditResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _GroupEditSheet(
+        group: group,
+        titleOverride: "Nouveau médicament",
+      ),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      final idx = _rows.indexWhere((r) => r.id == newRow.id);
+      if (idx == -1) return;
+      if (result == null || result.deleted) {
+        _rows.removeAt(idx);
+      } else {
+        _rows[idx].name   = result.name;
+        _rows[idx].form   = result.form;
+        _rows[idx].dosage = result.dosage;
+        _rows[idx].count  = result.count;
+      }
+    });
+  }
+
+  /// Add a row inheriting the parent's name, decrement parent count by 1,
+  /// then immediately open the edit sheet so the user fills form/dosage
+  /// (without which the new row would have the same groupKey and re-merge).
+  Future<void> _addChildRow(String parentName) async {
+    // 1. Decrement first matching parent row
+    _MedicineRow? target;
+    for (final r in _rows) {
+      if (_normName(r.name) == _normName(parentName) && r.count > 0) {
+        target = r;
+        break;
+      }
+    }
+
+    // 2. Create the new child row
+    final newRow = _MedicineRow(
+        name: parentName, form: '', dosage: '', count: 1);
+
+    setState(() {
+      if (target != null) target!.count = max(0, target!.count - 1);
+      _rows.add(newRow);
+    });
+
+    // 3. Immediately open the edit sheet for the new row so the user
+    //    can set form/dosage — otherwise it re-merges with the parent.
+    if (!mounted) return;
+    final group = _DisplayGroup(
+      key: newRow.groupKey,
+      name: newRow.name,
+      form: newRow.form,
+      dosage: newRow.dosage,
+      totalCount: newRow.count,
+      rows: [newRow],
+    );
+
+    final result = await showModalBottomSheet<_GroupEditResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _GroupEditSheet(
+        group: group,
+        titleOverride: "Nouvelle variante — ${parentName.isEmpty ? 'médicament' : parentName}",
+      ),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      final idx = _rows.indexWhere((r) => r.id == newRow.id);
+      if (idx == -1) return;
+      if (result == null || result.deleted) {
+        // User cancelled or deleted → remove new row and restore parent count
+        _rows.removeAt(idx);
+        if (target != null) {
+          final ti = _rows.indexWhere((r) => r.id == target!.id);
+          if (ti != -1) _rows[ti].count++;
+        }
+      } else {
+        _rows[idx].name   = result.name;
+        _rows[idx].form   = result.form;
+        _rows[idx].dosage = result.dosage;
+        _rows[idx].count  = result.count;
+      }
+    });
+  }
+
+  String _normName(String s) =>
+      s.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  /// Open the edit sheet for a display group. On save, update all its raw rows.
+  Future<void> _editGroup(_DisplayGroup g) async {
+    final result = await showModalBottomSheet<_GroupEditResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _GroupEditSheet(group: g),
+    );
+    if (result == null || !mounted) return;
+
+    setState(() {
+      if (result.deleted) {
+        // Remove all raw rows of this group
+        _rows.removeWhere((r) => g.rows.any((gr) => gr.id == r.id));
+        return;
+      }
+      // Apply edits to every raw row in the group
+      for (final r in g.rows) {
+        final idx = _rows.indexWhere((x) => x.id == r.id);
+        if (idx == -1) continue;
+        _rows[idx].name   = result.name;
+        _rows[idx].form   = result.form;
+        _rows[idx].dosage = result.dosage;
+      }
+      // Apply count: distribute evenly, remainder to first row
+      if (g.rows.isNotEmpty) {
+        final each = result.count ~/ g.rows.length;
+        final rem  = result.count % g.rows.length;
+        for (int i = 0; i < g.rows.length; i++) {
+          final idx = _rows.indexWhere((x) => x.id == g.rows[i].id);
+          if (idx == -1) continue;
+          _rows[idx].count = each + (i == 0 ? rem : 0);
+        }
+      }
+    });
   }
 
   void _confirmSave() {
@@ -1142,8 +1413,11 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
         const Duration(milliseconds: 2500), () => Navigator.pop(context));
   }
 
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
+    final groups = _groups;
     return Scaffold(
       backgroundColor: const Color(0xFFF8FAFC),
       body: Stack(
@@ -1153,487 +1427,426 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
               children: [
                 _buildHeader(),
                 Padding(
-                  padding: const EdgeInsets.all(20),
+                  padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
                   child: Column(
                     children: [
                       _buildShelfEditor(),
-                      const SizedBox(height: 20),
-                      _buildImageThumbnail(),
-                      const SizedBox(height: 20),
-                      _buildCountCard(),
                       const SizedBox(height: 16),
-                      _buildCountAdjust(),
+                      _buildTotalCard(groups),
                       const SizedBox(height: 24),
-                      _buildCropsGrid(),
-                      const SizedBox(height: 140),
+                      _buildSummaryList(groups),
+                      const SizedBox(height: 130),
                     ],
                   ),
                 ),
               ],
             ),
           ),
-          _buildBottomButtons(),
+          _buildBottomBar(),
           if (_showSuccess) _buildSuccessOverlay(),
         ],
       ),
     );
   }
 
+  // ── Header ────────────────────────────────────────────────────────────────
+
   Widget _buildHeader() => Container(
         width: double.infinity,
-        padding: const EdgeInsets.fromLTRB(24, 52, 24, 24),
+        padding: const EdgeInsets.fromLTRB(8, 48, 16, 20),
         decoration: const BoxDecoration(
           gradient: LinearGradient(
               colors: [Color(0xFF2563EB), Color(0xFF0D9488)]),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            IconButton(
-              onPressed: () => Navigator.pop(context),
-              icon: const Icon(Icons.arrow_back, color: Colors.white),
-            ),
-            const Text("Scan Results",
+        child: Row(children: [
+          IconButton(
+            onPressed: () => Navigator.pop(context),
+            icon: const Icon(Icons.arrow_back, color: Colors.white),
+          ),
+          const Expanded(
+            child: Text("Résultats du scan",
                 style: TextStyle(
                     color: Colors.white,
-                    fontSize: 28,
+                    fontSize: 22,
                     fontWeight: FontWeight.bold)),
-          ],
-        ),
+          ),
+          if (_loadingCrops)
+            const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2.5, color: Colors.white70)),
+        ]),
       );
 
+  // ── Shelf editor ──────────────────────────────────────────────────────────
+
   Widget _buildShelfEditor() => Container(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)],
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
         ),
         child: Row(children: [
-          const Icon(Icons.shelves, color: Color(0xFF2563EB)),
-          const SizedBox(width: 16),
+          const Icon(Icons.shelves, color: Color(0xFF2563EB), size: 20),
+          const SizedBox(width: 12),
           Expanded(
             child: _isEditingShelf
                 ? TextField(
                     controller: _shelfCtrl,
-                    decoration: const InputDecoration(isDense: true))
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                        isDense: true, border: InputBorder.none))
                 : Text(_shelfName,
                     style: const TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.bold)),
+                        fontSize: 16, fontWeight: FontWeight.bold)),
           ),
-          IconButton(
-            icon: Icon(_isEditingShelf ? Icons.check : Icons.edit),
-            onPressed: () => setState(() {
+          GestureDetector(
+            onTap: () => setState(() {
               if (_isEditingShelf) _shelfName = _shelfCtrl.text;
               _isEditingShelf = !_isEditingShelf;
             }),
+            child: Icon(_isEditingShelf ? Icons.check : Icons.edit_outlined,
+                size: 20, color: const Color(0xFF64748B)),
           ),
         ]),
       );
 
-  Widget _buildImageThumbnail() {
-    return Container(
-      width: double.infinity,
-      constraints: const BoxConstraints(maxHeight: 220),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        color: const Color(0xFF1E293B),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: RawImage(
-        image: widget.capturedImage,
-        fit: BoxFit.contain,
-        filterQuality: FilterQuality.medium,
-      ),
-    );
-  }
+  // ── Total card ────────────────────────────────────────────────────────────
 
-  Widget _buildCountCard() => Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(24),
+  Widget _buildTotalCard(List<_DisplayGroup> groups) => Container(
+        padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 22),
         decoration: BoxDecoration(
           gradient: const LinearGradient(
               colors: [Color(0xFF2563EB), Color(0xFF0D9488)]),
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(20),
         ),
-        child: Column(children: [
-          const Text("Total Boxes Detected",
-              style: TextStyle(color: Colors.white70)),
-          Text("$_count",
-              style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 64,
-                  fontWeight: FontWeight.bold)),
-        ]),
-      );
-
-  Widget _buildCountAdjust() => Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          _circleBtn(
-              Icons.remove, Colors.red, () => setState(() => _count = max(0, _count - 1))),
-          const SizedBox(width: 24),
-          Text("$_count",
-              style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold)),
-          const SizedBox(width: 24),
-          _circleBtn(
-              Icons.add, Colors.green, () => setState(() => _count++)),
-        ],
-      );
-
-  Widget _circleBtn(IconData icon, Color color, VoidCallback onTap) =>
-      GestureDetector(
-        onTap: onTap,
-        child: Container(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-              color: color, borderRadius: BorderRadius.circular(20)),
-          child: Icon(icon, color: Colors.white),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text("Total boîtes",
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+              Text("$_grandTotal",
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 48,
+                      fontWeight: FontWeight.bold,
+                      height: 1.1)),
+            ]),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Text("${groups.length}",
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.bold)),
+              const Text("type(s) distincts",
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+            ]),
+          ],
         ),
       );
 
-  // ── Crops grid ────────────────────────────────────────────────────────────
+  // ── Summary list ──────────────────────────────────────────────────────────
 
-  Widget _buildCropsGrid() {
-    if (widget.detectedBoxes.isEmpty) return const SizedBox.shrink();
-
+  Widget _buildSummaryList(List<_DisplayGroup> groups) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(children: [
-          const Text("Detected Boxes",
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(width: 8),
-          if (_loadingCrops)
-            const SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(
-                    strokeWidth: 2, color: Color(0xFF14B8A6))),
+          const Text("Résumé par médicament",
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+          const Spacer(),
+          // Hint text
+          const Text("Tap pour modifier",
+              style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
         ]),
         const SizedBox(height: 12),
-        GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 3,
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
-            childAspectRatio: 0.75,
-          ),
-          itemCount: widget.detectedBoxes.length,
-          itemBuilder: (_, i) {
-            final b = widget.detectedBoxes[i];
-            final cropBytes = _crops[b.id];
-            final ocrResult = _ocrResults[b.id];
-            final ocrDone = _ocrResults.containsKey(b.id);
-            return _buildCropCard(b, cropBytes, ocrResult: ocrResult, ocrDone: ocrDone);
-          },
-        ),
+
+        // One card per display group
+        ...groups.map((g) => Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: _buildGroupCard(g),
+            )),
+
+        // ── "Add empty" card ──────────────────────────────────────────────
+        _buildAddEmptyCard(),
       ],
     );
   }
 
-  Widget _buildCropCard(DetectedBox b, Uint8List? bytes,
-      {OcrResult? ocrResult, bool ocrDone = false}) {
-    final bool ocrLoading = bytes != null && !ocrDone;
+  // ── Group card ────────────────────────────────────────────────────────────
+
+  Widget _buildGroupCard(_DisplayGroup g) {
+    final color = _colorForKey(g.key);
+    final bool noName   = g.name.trim().isEmpty;
+    final bool noForm   = g.form.trim().isEmpty;
+    final bool noDosage = g.dosage.trim().isEmpty;
 
     return Container(
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(16),
         boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
+        border: Border(left: BorderSide(color: color, width: 4)),
       ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // ── Crop image (tap → raw OCR debug sheet) ──────────────────
-          Expanded(
-            child: GestureDetector(
-              onTap: ocrDone
-                  ? () => _showRawOcrSheet(
-                        context,
-                        boxId: b.id,
-                        label: b.label,
-                        bytes: bytes,
-                        ocrResult: ocrResult,
-                      )
-                  : null,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  bytes != null
-                      ? Image.memory(bytes, fit: BoxFit.cover)
-                      : Container(
-                          color: const Color(0xFF1E293B),
-                          child: const Center(
-                            child: SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Color(0xFF14B8A6))),
-                          ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Material(
+          color: Colors.white,
+          child: Column(
+            children: [
+              // ── Main row: info + count stepper ─────────────────────
+              InkWell(
+                onTap: () => _editGroup(g),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+                  child: Row(
+                    children: [
+                      // ── Left block ──────────────────────────────────
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              Expanded(
+                                child: Text(
+                                  noName ? "— Nom inconnu —" : g.name,
+                                  style: TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.bold,
+                                      color: noName
+                                          ? Colors.grey
+                                          : const Color(0xFF1E293B),
+                                      fontStyle: noName
+                                          ? FontStyle.italic
+                                          : FontStyle.normal),
+                                ),
+                              ),
+                              const Icon(Icons.edit_outlined,
+                                  size: 14, color: Color(0xFFCBD5E1)),
+                            ]),
+                            const SizedBox(height: 6),
+                            Wrap(spacing: 6, runSpacing: 4, children: [
+                              _chip(Icons.category_outlined,
+                                  noForm ? "Forme ?" : g.form,
+                                  const Color(0xFF0EA5E9),
+                                  faded: noForm),
+                              _chip(Icons.science_outlined,
+                                  noDosage ? "Dosage ?" : g.dosage,
+                                  const Color(0xFFF59E0B),
+                                  faded: noDosage),
+                            ]),
+                          ],
                         ),
-                  // Small "tap to inspect" hint once OCR is done
-                  if (ocrDone)
-                    Positioned(
-                      bottom: 4,
-                      right: 4,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 5, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.black54,
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: const Icon(Icons.text_snippet_outlined,
-                            size: 11, color: Colors.white),
                       ),
+                      const SizedBox(width: 10),
+                      _buildStepper(g, color),
+                    ],
+                  ),
+                ),
+              ),
+
+              // ── Footer: "Ajouter variante" ──────────────────────────
+              const Divider(height: 1, thickness: 0.5, indent: 14),
+              InkWell(
+                onTap: () {
+                  if (noName) {
+                    _addEmptyRowWithEdit();
+                  } else {
+                    _addChildRow(g.name);
+                  }
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 10),
+                  child: Row(children: [
+                    Icon(Icons.add_circle_outline, size: 15, color: color),
+                    const SizedBox(width: 6),
+                    Text(
+                      noName
+                          ? "Ajouter une ligne vide"
+                          : "Ajouter variante (${g.name})",
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: color,
+                          fontWeight: FontWeight.w600),
                     ),
+                  ]),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _chip(IconData icon, String text, Color color,
+      {bool faded = false}) =>
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: faded
+              ? Colors.grey.withOpacity(0.08)
+              : color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, size: 10, color: faded ? Colors.grey : color),
+          const SizedBox(width: 4),
+          Text(text,
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  color: faded ? Colors.grey : color,
+                  fontStyle:
+                      faded ? FontStyle.italic : FontStyle.normal)),
+        ]),
+      );
+
+  Widget _buildStepper(_DisplayGroup g, Color color) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Count badge
+          Container(
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              "${g.totalCount}",
+              style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  color: color),
+            ),
+          ),
+          const SizedBox(height: 5),
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            _stepBtn(Icons.remove_rounded, color, () {
+              setState(() {
+                // Decrement: subtract from first row with count > 0
+                for (final r in g.rows) {
+                  final idx = _rows.indexWhere((x) => x.id == r.id);
+                  if (idx != -1 && _rows[idx].count > 0) {
+                    _rows[idx].count--;
+                    break;
+                  }
+                }
+              });
+            }),
+            const SizedBox(width: 4),
+            _stepBtn(Icons.add_rounded, color, () {
+              setState(() {
+                // Increment: add to first row
+                if (g.rows.isNotEmpty) {
+                  final idx = _rows.indexWhere((x) => x.id == g.rows.first.id);
+                  if (idx != -1) _rows[idx].count++;
+                }
+              });
+            }),
+          ]),
+        ],
+      );
+
+  Widget _stepBtn(IconData icon, Color color, VoidCallback onTap) =>
+      GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 26,
+          height: 26,
+          decoration: BoxDecoration(
+              color: color.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(7)),
+          child: Icon(icon, size: 15, color: color),
+        ),
+      );
+
+  // ── "Add empty" last card ─────────────────────────────────────────────────
+
+  Widget _buildAddEmptyCard() => ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Material(
+          color: Colors.white,
+          child: InkWell(
+            onTap: _addEmptyRow,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                    color: const Color(0xFFCBD5E1),
+                    width: 1.5),
+              ),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.add_rounded,
+                      color: Color(0xFF64748B), size: 20),
+                  SizedBox(width: 8),
+                  Text("Ajouter un médicament manuellement",
+                      style: TextStyle(
+                          fontSize: 13,
+                          color: Color(0xFF64748B),
+                          fontWeight: FontWeight.w600)),
                 ],
               ),
             ),
           ),
-          // ── Info panel ──────────────────────────────────────────────────
-          Padding(
-            padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // YOLO confidence badge
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(b.label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 11, fontWeight: FontWeight.bold)),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 5, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF14B8A6).withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        "${(b.confidence * 100).round()}%",
-                        style: const TextStyle(
-                            fontSize: 9,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF0F9688)),
-                      ),
-                    ),
-                  ],
-                ),
-
-                // ── OCR loading indicator ────────────────────────────────
-                if (ocrLoading) ...[
-                  const SizedBox(height: 5),
-                  Row(children: const [
-                    SizedBox(
-                        width: 9,
-                        height: 9,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 1.5, color: Color(0xFF6366F1))),
-                    SizedBox(width: 5),
-                    Text("Lecture OCR...",
-                        style:
-                            TextStyle(fontSize: 9, color: Color(0xFF6366F1))),
-                  ]),
-                ],
-
-                // ── OCR results ──────────────────────────────────────────
-                if (ocrDone && ocrResult != null) ...[
-                  const SizedBox(height: 5),
-                  const Divider(height: 1, thickness: 0.5, color: Color(0xFFE2E8F0)),
-                  const SizedBox(height: 4),
-
-                  // Medicine name — DB match OR largest visual text fallback
-                  if (ocrResult.hasName) ...[
-                    // ✅ Matched in database
-                    _ocrRow(
-                      icon: Icons.medication_outlined,
-                      iconColor: const Color(0xFF6366F1),
-                      label: ocrResult.matchedName!,
-                      labelStyle: const TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF1E293B)),
-                    ),
-                  ] else if (ocrResult.hasLargestText) ...[
-                    // 📝 Fallback — largest text on the box (brand name heuristic)
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.text_fields_rounded,
-                            size: 11, color: Color(0xFFF97316)),
-                        const SizedBox(width: 4),
-                        Expanded(
-                          child: Text(
-                            ocrResult.largestText!,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w700,
-                              color: Color(0xFFF97316),
-                            ),
-                          ),
-                        ),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 4, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF97316).withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text('OCR',
-                              style: TextStyle(
-                                  fontSize: 7,
-                                  color: Color(0xFFF97316),
-                                  fontWeight: FontWeight.bold)),
-                        ),
-                      ],
-                    ),
-                  ] else ...[
-                    _ocrRow(
-                      icon: Icons.medication_outlined,
-                      iconColor: const Color(0xFF6366F1),
-                      label: '—',
-                      labelStyle:
-                          const TextStyle(fontSize: 10, color: Colors.grey),
-                    ),
-                  ],
-                  const SizedBox(height: 3),
-
-                  // Form / type
-                  _ocrRow(
-                    icon: Icons.category_outlined,
-                    iconColor: const Color(0xFF0EA5E9),
-                    label: ocrResult.hasForm ? ocrResult.form! : '—',
-                    labelStyle: TextStyle(
-                        fontSize: 9,
-                        color: ocrResult.hasForm
-                            ? const Color(0xFF475569)
-                            : Colors.grey),
-                  ),
-                  const SizedBox(height: 3),
-
-                  // Dosage
-                  _ocrRow(
-                    icon: Icons.science_outlined,
-                    iconColor: const Color(0xFFF59E0B),
-                    label: ocrResult.hasDosage ? ocrResult.dosage! : '—',
-                    labelStyle: TextStyle(
-                        fontSize: 9,
-                        color: ocrResult.hasDosage
-                            ? const Color(0xFF475569)
-                            : Colors.grey),
-                  ),
-
-                  // Fallback warning
-                  if (ocrResult.isFallback) ...[
-                    const SizedBox(height: 3),
-                    const Text(
-                      '⚠ Non trouvé en base',
-                      style: TextStyle(fontSize: 7, color: Colors.orange),
-                    ),
-                  ],
-                ],
-
-                // ── Nothing recognized at all ────────────────────────────
-                if (ocrDone && ocrResult == null) ...[
-                  const SizedBox(height: 4),
-                  const Text("OCR: aucun texte détecté",
-                      style: TextStyle(fontSize: 9, color: Colors.grey)),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Small icon + text row used in the OCR panel.
-  Widget _ocrRow({
-    required IconData icon,
-    required Color iconColor,
-    required String label,
-    required TextStyle labelStyle,
-  }) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, size: 11, color: iconColor),
-        const SizedBox(width: 4),
-        Expanded(
-          child: Text(label,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: labelStyle),
         ),
-      ],
-    );
-  }
+      );
 
-  // ── Raw OCR debug bottom sheet ───────────────────────────────────────────
+  // ── Bottom bar ────────────────────────────────────────────────────────────
 
-  void _showRawOcrSheet(
-    BuildContext context, {
-    required int boxId,
-    required String label,
-    required Uint8List? bytes,
-    required OcrResult? ocrResult,
-  }) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => _OcrDebugSheet(
-        boxId: boxId,
-        label: label,
-        bytes: bytes,
-        ocrResult: ocrResult,
-      ),
-    );
-  }
-
-  Widget _buildBottomButtons() => Positioned(
+  Widget _buildBottomBar() => Positioned(
         bottom: 0,
         left: 0,
         right: 0,
         child: Container(
-          padding: const EdgeInsets.all(20),
-          color: Colors.white,
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                  color: Colors.black.withOpacity(0.08),
+                  blurRadius: 12,
+                  offset: const Offset(0, -4))
+            ],
+          ),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             ElevatedButton(
               style: ElevatedButton.styleFrom(
-                minimumSize: const Size(double.infinity, 60),
+                minimumSize: const Size(double.infinity, 56),
                 backgroundColor: const Color(0xFF2563EB),
                 shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(15)),
+                    borderRadius: BorderRadius.circular(14)),
+                elevation: 0,
               ),
               onPressed: _confirmSave,
-              child: const Text("Confirm Result",
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16)),
+              child: Text(
+                "Confirmer  ·  $_grandTotal boîte${_grandTotal != 1 ? 's' : ''}",
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16),
+              ),
             ),
+            const SizedBox(height: 6),
             TextButton(
               onPressed: () => Navigator.pop(context),
-              child:
-                  const Text("Back to Editor", style: TextStyle(color: Colors.grey)),
+              child: const Text("Retour à l'éditeur",
+                  style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13)),
             ),
           ]),
         ),
       );
+
+  // ── Success overlay ───────────────────────────────────────────────────────
 
   Widget _buildSuccessOverlay() => Positioned.fill(
         child: Container(
@@ -1643,22 +1856,25 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
               position: _slideAnim,
               child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 40),
-                padding:
-                    const EdgeInsets.symmetric(vertical: 30, horizontal: 20),
+                padding: const EdgeInsets.symmetric(
+                    vertical: 30, horizontal: 20),
                 decoration: BoxDecoration(
                   gradient: const LinearGradient(
                       colors: [Color(0xFF059669), Color(0xFF10B981)]),
                   borderRadius: BorderRadius.circular(30),
                 ),
-                child: const Column(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.check_circle, size: 80, color: Colors.white),
-                  SizedBox(height: 20),
-                  Text("SCAN CONFIRMED",
-                      style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold)),
-                ]),
+                child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.check_circle,
+                          size: 80, color: Colors.white),
+                      SizedBox(height: 16),
+                      Text("SCAN CONFIRMÉ",
+                          style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold)),
+                    ]),
               ),
             ),
           ),
@@ -1666,6 +1882,300 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
       );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Group edit bottom sheet
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _GroupEditResult {
+  final String name;
+  final String form;
+  final String dosage;
+  final int count;
+  final bool deleted;
+  const _GroupEditResult({
+    required this.name,
+    required this.form,
+    required this.dosage,
+    required this.count,
+    this.deleted = false,
+  });
+}
+
+class _GroupEditSheet extends StatefulWidget {
+  final _DisplayGroup group;
+  final String? titleOverride;
+  const _GroupEditSheet({required this.group, this.titleOverride});
+
+  @override
+  State<_GroupEditSheet> createState() => _GroupEditSheetState();
+}
+
+class _GroupEditSheetState extends State<_GroupEditSheet> {
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _formCtrl;
+  late final TextEditingController _dosageCtrl;
+  late int _count;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameCtrl   = TextEditingController(text: widget.group.name);
+    _formCtrl   = TextEditingController(text: widget.group.form);
+    _dosageCtrl = TextEditingController(text: widget.group.dosage);
+    _count      = widget.group.totalCount;
+    // Rebuild clear buttons when text changes
+    _nameCtrl.addListener(() => setState(() {}));
+    _formCtrl.addListener(() => setState(() {}));
+    _dosageCtrl.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _formCtrl.dispose();
+    _dosageCtrl.dispose();
+    super.dispose();
+  }
+
+  void _save() => Navigator.pop(
+        context,
+        _GroupEditResult(
+          name: _nameCtrl.text.trim(),
+          form: _formCtrl.text.trim(),
+          dosage: _dosageCtrl.text.trim(),
+          count: _count,
+        ),
+      );
+
+  void _delete() => showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text("Supprimer cette ligne ?"),
+          content: Text(
+              "\"${_nameCtrl.text.isEmpty ? 'Nom inconnu' : _nameCtrl.text}\" "
+              "sera retiré du résumé."),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("Annuler")),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade600),
+              onPressed: () {
+                Navigator.pop(context); // close dialog
+                Navigator.pop(
+                    context,
+                    const _GroupEditResult(
+                        name: '', form: '', dosage: '', count: 0,
+                        deleted: true));
+              },
+              child: const Text("Supprimer",
+                  style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      // Push sheet above keyboard
+      padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: DraggableScrollableSheet(
+        initialChildSize: 0.65,
+        minChildSize: 0.45,
+        maxChildSize: 0.92,
+        expand: false,
+        builder: (_, scrollCtrl) => Container(
+          decoration: const BoxDecoration(
+            color: Color(0xFF0F172A),
+            borderRadius:
+                BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: ListView(
+            controller: scrollCtrl,
+            padding: EdgeInsets.zero,
+            children: [
+              // ── Handle ────────────────────────────────────────────────
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 10, bottom: 6),
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+              ),
+
+              // ── Title row ────────────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 4, 10, 14),
+                child: Row(children: [
+                  Expanded(
+                    child: Text(
+                        widget.titleOverride ?? "Modifier le médicament",
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline,
+                        color: Colors.redAccent, size: 20),
+                    tooltip: "Supprimer cette ligne",
+                    onPressed: _delete,
+                  ),
+                  TextButton(
+                    onPressed: _save,
+                    child: const Text("Enregistrer",
+                        style: TextStyle(
+                            color: Color(0xFF14B8A6),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14)),
+                  ),
+                ]),
+              ),
+
+              const Divider(height: 1, color: Color(0xFF1E293B)),
+              const SizedBox(height: 14),
+
+              // ── Edit fields ──────────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Column(children: [
+                  _field(
+                    ctrl: _nameCtrl,
+                    label: "Nom du médicament",
+                    icon: Icons.medication_outlined,
+                    color: const Color(0xFF6366F1),
+                    hint: "ex: Doliprane",
+                  ),
+                  const SizedBox(height: 10),
+                  _field(
+                    ctrl: _formCtrl,
+                    label: "Forme pharmaceutique",
+                    icon: Icons.category_outlined,
+                    color: const Color(0xFF0EA5E9),
+                    hint: "ex: Comprimé, Sirop, Injectable…",
+                  ),
+                  const SizedBox(height: 10),
+                  _field(
+                    ctrl: _dosageCtrl,
+                    label: "Dosage",
+                    icon: Icons.science_outlined,
+                    color: const Color(0xFFF59E0B),
+                    hint: "ex: 500 MG, 1 G / 5 ML…",
+                  ),
+                ]),
+              ),
+
+              const SizedBox(height: 20),
+              const Divider(height: 1, color: Color(0xFF1E293B)),
+              const SizedBox(height: 16),
+
+              // ── Count adjuster ────────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("Nombre de boîtes",
+                        style: TextStyle(
+                            color: Color(0xFF94A3B8),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _countBtn(Icons.remove_rounded, Colors.redAccent,
+                            () => setState(
+                                () => _count = max(0, _count - 1))),
+                        const SizedBox(width: 28),
+                        Text("$_count",
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 48,
+                                fontWeight: FontWeight.bold)),
+                        const SizedBox(width: 28),
+                        _countBtn(Icons.add_rounded,
+                            const Color(0xFF14B8A6),
+                            () => setState(() => _count++)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 28),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _field({
+    required TextEditingController ctrl,
+    required String label,
+    required IconData icon,
+    required Color color,
+    required String hint,
+  }) =>
+      Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E293B),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+        child: Row(children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: TextField(
+              controller: ctrl,
+              style: const TextStyle(color: Colors.white, fontSize: 14),
+              decoration: InputDecoration(
+                labelText: label,
+                labelStyle:
+                    TextStyle(color: color.withOpacity(0.8), fontSize: 11),
+                hintText: hint,
+                hintStyle: const TextStyle(
+                    color: Color(0xFF475569), fontSize: 12),
+                border: InputBorder.none,
+                isDense: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(vertical: 10),
+              ),
+            ),
+          ),
+          if (ctrl.text.isNotEmpty)
+            GestureDetector(
+              onTap: () => ctrl.clear(),
+              child: const Icon(Icons.close_rounded,
+                  size: 16, color: Color(0xFF64748B)),
+            ),
+        ]),
+      );
+
+  Widget _countBtn(IconData icon, Color color, VoidCallback onTap) =>
+      GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+              color: color.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(12)),
+          child: Icon(icon, color: color, size: 22),
+        ),
+      );
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Grid painter (camera preview overlay)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1686,209 +2196,4 @@ class _GridPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter _) => false;
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// OCR Debug Bottom Sheet
-// ═════════════════════════════════════════════════════════════════════════════
-
-class _OcrDebugSheet extends StatelessWidget {
-  final int boxId;
-  final String label;
-  final Uint8List? bytes;
-  final OcrResult? ocrResult;
-
-  const _OcrDebugSheet({
-    required this.boxId,
-    required this.label,
-    required this.bytes,
-    required this.ocrResult,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final raw = ocrResult?.rawText ?? '';
-    final lines = raw.isEmpty
-        ? <String>[]
-        : raw.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
-
-    return DraggableScrollableSheet(
-      initialChildSize: 0.6,
-      minChildSize: 0.35,
-      maxChildSize: 0.92,
-      expand: false,
-      builder: (_, scrollCtrl) => Container(
-        decoration: const BoxDecoration(
-          color: Color(0xFF0F172A),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
-        child: Column(
-          children: [
-            // ── Handle ────────────────────────────────────────────────────
-            Padding(
-              padding: const EdgeInsets.only(top: 10, bottom: 4),
-              child: Container(
-                width: 38,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: Colors.white24,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-            ),
-
-            // ── Header row ────────────────────────────────────────────────
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
-              child: Row(
-                children: [
-                  // Crop thumbnail
-                  if (bytes != null)
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.memory(bytes!,
-                          width: 54, height: 54, fit: BoxFit.cover),
-                    ),
-                  if (bytes != null) const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Box #$boxId — $label',
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 3),
-                        Text(
-                          '${lines.length} ligne(s) OCR extraite(s)',
-                          style: const TextStyle(
-                              color: Color(0xFF94A3B8), fontSize: 11),
-                        ),
-                      ],
-                    ),
-                  ),
-                  // Copy button
-                  IconButton(
-                    icon: const Icon(Icons.copy_rounded,
-                        color: Color(0xFF14B8A6), size: 18),
-                    tooltip: 'Copier le texte brut',
-                    onPressed: raw.isEmpty
-                        ? null
-                        : () {
-                            Clipboard.setData(ClipboardData(text: raw));
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Texte copié'),
-                                duration: Duration(seconds: 1),
-                              ),
-                            );
-                          },
-                  ),
-                ],
-              ),
-            ),
-
-            const Divider(height: 1, color: Color(0xFF1E293B)),
-
-            // ── Parsed summary strip ──────────────────────────────────────
-            if (ocrResult != null)
-              Container(
-                color: const Color(0xFF1E293B),
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 8),
-                child: Row(
-                  children: [
-                    _chip(Icons.medication_outlined, const Color(0xFF6366F1),
-                        ocrResult!.matchedName ?? '—'),
-                    const SizedBox(width: 8),
-                    _chip(Icons.category_outlined, const Color(0xFF0EA5E9),
-                        ocrResult!.form ?? '—'),
-                    const SizedBox(width: 8),
-                    _chip(Icons.science_outlined, const Color(0xFFF59E0B),
-                        ocrResult!.dosage ?? '—'),
-                  ],
-                ),
-              ),
-
-            const Divider(height: 1, color: Color(0xFF1E293B)),
-
-            // ── Raw OCR lines list ────────────────────────────────────────
-            Expanded(
-              child: raw.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'Aucun texte extrait par ML Kit.',
-                        style: TextStyle(color: Color(0xFF64748B)),
-                      ),
-                    )
-                  : ListView.separated(
-                      controller: scrollCtrl,
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-                      itemCount: lines.length,
-                      separatorBuilder: (_, __) => const Divider(
-                          height: 1, color: Color(0xFF1E293B)),
-                      itemBuilder: (_, i) => Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 9),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            // Line number badge
-                            Container(
-                              width: 22,
-                              height: 22,
-                              alignment: Alignment.center,
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF1E293B),
-                                borderRadius: BorderRadius.circular(5),
-                              ),
-                              child: Text(
-                                '${i + 1}',
-                                style: const TextStyle(
-                                    color: Color(0xFF64748B),
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.w600),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: SelectableText(
-                                lines[i],
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 13,
-                                  fontFamily: 'monospace',
-                                  height: 1.4,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _chip(IconData icon, Color color, String text) => Expanded(
-        child: Row(
-          children: [
-            Icon(icon, size: 11, color: color),
-            const SizedBox(width: 4),
-            Expanded(
-              child: Text(
-                text,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                    color: text == '—' ? const Color(0xFF475569) : Colors.white,
-                    fontSize: 10),
-              ),
-            ),
-          ],
-        ),
-      );
 }
