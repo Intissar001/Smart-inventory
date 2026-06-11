@@ -16,7 +16,6 @@ class _SessionScreenState extends State<SessionScreen> {
   @override
   void initState() {
     super.initState();
-    // Make sure the session is loaded for the current user
     WidgetsBinding.instance.addPostFrameCallback((_) => _ensureSession());
   }
 
@@ -29,12 +28,51 @@ class _SessionScreenState extends State<SessionScreen> {
     }
   }
 
+  Future<void> _addEmptyZone() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("New Zone"),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: "e.g. Shelf C, Zone 4…",
+            labelText: "Zone name",
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Cancel")),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(context, ctrl.text.trim()),
+              child: const Text("Add")),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty || !mounted) return;
+    await context.read<SessionProvider>().addEmptyZone(name);
+  }
+
+  Future<void> _rescanZone(String lockedZoneName) async {
+    final result = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(builder: (_) => const CameraScanScreen()),
+    );
+    if (result == null || !mounted) return;
+    final lockedResult = Map<String, dynamic>.from(result)
+      ..['zoneName'] = lockedZoneName;
+    await context.read<SessionProvider>().handleScanResult(lockedResult);
+  }
+
   // ── UI ──────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    final isDark    = context.watch<SettingsProvider>().darkMode;
-    final sp        = context.watch<SessionProvider>();
+    final isDark = context.watch<SettingsProvider>().darkMode;
+    final sp     = context.watch<SessionProvider>();
 
     if (sp.loading) {
       return Scaffold(
@@ -80,9 +118,7 @@ class _SessionScreenState extends State<SessionScreen> {
   // ── Header ──────────────────────────────────────────────────
 
   Widget _buildHeader(bool isDark, SessionProvider sp) {
-    final progress = sp.zones.isEmpty
-        ? 0.0
-        : sp.doneZones / sp.zones.length;
+    final progress = sp.zones.isEmpty ? 0.0 : sp.doneZones / sp.zones.length;
 
     return Container(
       width: double.infinity,
@@ -140,12 +176,16 @@ class _SessionScreenState extends State<SessionScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    _summaryItem("Total Boxes", "${sp.totalBoxes}",
+                    _summaryItem(
+                        "Total Boxes",
+                        "${sp.totalBoxes}",
                         isDark ? const Color(0xFF818CF8) : const Color(0xFF2563EB),
                         isDark),
-                    _summaryItem("Progress",
+                    _summaryItem(
+                        "Progress",
                         "${sp.doneZones}/${sp.zones.length}",
-                        const Color(0xFF10B981), isDark),
+                        const Color(0xFF10B981),
+                        isDark),
                   ],
                 ),
                 const SizedBox(height: 20),
@@ -224,14 +264,14 @@ class _SessionScreenState extends State<SessionScreen> {
                   fontSize: 15,
                   fontWeight: FontWeight.w500)),
           const SizedBox(height: 4),
-          Text('Tap "Scan Next Zone" to start',
+          Text('Tap "Scan Zone" or "Add Zone" to start',
               style: TextStyle(
                   color: isDark ? Colors.white24 : Colors.grey.shade400,
                   fontSize: 13)),
         ]),
       );
 
-  // ── Zone card (rich) ────────────────────────────────────────
+  // ── Zone card ───────────────────────────────────────────────
 
   static const List<Color> _zonePalette = [
     Color(0xFF6366F1), Color(0xFF14B8A6), Color(0xFFF59E0B), Color(0xFFEF4444),
@@ -245,8 +285,6 @@ class _SessionScreenState extends State<SessionScreen> {
         ? _zonePalette[zoneIndex % _zonePalette.length]
         : (isDark ? const Color(0xFF334155) : const Color(0xFFCBD5E1));
 
-    // Flutter requires uniform border colors when borderRadius is used.
-    // Use a Stack: rounded clip outer + 4px accent strip on left side.
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
@@ -265,7 +303,7 @@ class _SessionScreenState extends State<SessionScreen> {
         borderRadius: BorderRadius.circular(16),
         child: Stack(
           children: [
-            // Card background + thin uniform border
+            // ── Card body ─────────────────────────────────────
             Container(
               decoration: BoxDecoration(
                 color: isDark ? const Color(0xFF1E293B) : Colors.white,
@@ -280,7 +318,7 @@ class _SessionScreenState extends State<SessionScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // ── Zone header row ──────────────────────────
+                  // ── Zone header ───────────────────────────
                   Padding(
                     padding: const EdgeInsets.fromLTRB(18, 14, 12, 10),
                     child: Row(
@@ -351,7 +389,7 @@ class _SessionScreenState extends State<SessionScreen> {
                     ),
                   ),
 
-                  // ── Medicine detail rows ─────────────────────
+                  // ── Medicine rows ─────────────────────────
                   if (isDone && zone.meds.isNotEmpty) ...[
                     Divider(
                         height: 1,
@@ -381,7 +419,7 @@ class _SessionScreenState extends State<SessionScreen> {
 
                   if (isDone && zone.meds.isEmpty)
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(18, 0, 14, 10),
+                      padding: const EdgeInsets.fromLTRB(18, 0, 14, 6),
                       child: Text('No medicines identified',
                           style: TextStyle(
                               fontSize: 11,
@@ -390,10 +428,40 @@ class _SessionScreenState extends State<SessionScreen> {
                                   : Colors.grey.shade400,
                               fontStyle: FontStyle.italic)),
                     ),
+
+                  // ── Rescan / Scan button ───────────────────
+                  Divider(
+                      height: 1,
+                      thickness: 0.5,
+                      color: isDark
+                          ? Colors.white.withOpacity(0.06)
+                          : const Color(0xFFF1F5F9)),
+                  InkWell(
+                    onTap: () => _rescanZone(zone.name),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 18, vertical: 10),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.replay_rounded, size: 14, color: accent),
+                          const SizedBox(width: 6),
+                          Text(
+                            isDone ? "Rescan this zone" : "Scan this zone",
+                            style: TextStyle(
+                                fontSize: 12,
+                                color: accent,
+                                fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
-            // Accent left strip (4px) — drawn on top of card edge
+
+            // ── Accent left strip ──────────────────────────────
             Positioned(
               left: 0, top: 0, bottom: 0,
               child: Container(
@@ -413,9 +481,9 @@ class _SessionScreenState extends State<SessionScreen> {
     );
   }
 
-  /// One row per medicine in a zone
-  Widget _buildMedRow(
-      ZoneMedEntry med, Color accent, bool isDark, int zoneId) {
+  // ── Med row ─────────────────────────────────────────────────
+
+  Widget _buildMedRow(ZoneMedEntry med, Color accent, bool isDark, int zoneId) {
     final hasDetail = med.dosage.isNotEmpty || med.form.isNotEmpty;
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
@@ -437,7 +505,9 @@ class _SessionScreenState extends State<SessionScreen> {
                     style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w600,
-                        color: isDark ? Colors.white : const Color(0xFF1E293B))),
+                        color: isDark
+                            ? Colors.white
+                            : const Color(0xFF1E293B))),
                 if (hasDetail)
                   Padding(
                     padding: const EdgeInsets.only(top: 3),
@@ -453,7 +523,6 @@ class _SessionScreenState extends State<SessionScreen> {
               ],
             ),
           ),
-          // Count badge
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
@@ -489,29 +558,59 @@ class _SessionScreenState extends State<SessionScreen> {
   Widget _buildActionButtons(bool isDark, SessionProvider sp) {
     return Column(
       children: [
-        ElevatedButton.icon(
-          onPressed: () async {
-            final result = await Navigator.push<Map<String, dynamic>>(
-              context,
-              MaterialPageRoute(builder: (_) => const CameraScanScreen()),
-            );
-            if (result != null && mounted) {
-              await context.read<SessionProvider>().handleScanResult(result);
-            }
-          },
-          icon: const Icon(Icons.qr_code_scanner_rounded),
-          label: const Text("Scan Next Zone",
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: const Color(0xFF6366F1),
-            foregroundColor: Colors.white,
-            minimumSize: const Size(double.infinity, 60),
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16)),
-            elevation: 0,
-          ),
+        // Row 1: Scan Zone + Add Zone
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: () async {
+                  final result = await Navigator.push<Map<String, dynamic>>(
+                    context,
+                    MaterialPageRoute(builder: (_) => const CameraScanScreen()),
+                  );
+                  if (result != null && mounted) {
+                    await context
+                        .read<SessionProvider>()
+                        .handleScanResult(result);
+                  }
+                },
+                icon: const Icon(Icons.qr_code_scanner_rounded),
+                label: const Text("Scan Zone",
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 15)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6366F1),
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size(0, 60),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16)),
+                  elevation: 0,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            ElevatedButton.icon(
+              onPressed: _addEmptyZone,
+              icon: const Icon(Icons.add_rounded, size: 20),
+              label: const Text("Add Zone",
+                  style: TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 15)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.transparent,
+                foregroundColor: const Color(0xFF6366F1),
+                minimumSize: const Size(0, 60),
+                elevation: 0,
+                shadowColor: Colors.transparent,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: const BorderSide(color: Color(0xFF6366F1)),
+                ),
+              ),
+            ),
+          ],
         ),
         const SizedBox(height: 12),
+        // Row 2: Save + Exit
         Row(
           children: [
             Expanded(
@@ -519,7 +618,6 @@ class _SessionScreenState extends State<SessionScreen> {
                 onPressed: () async {
                   await sp.saveSession();
                   if (!mounted) return;
-                  // Reload fresh session
                   final auth   = context.read<AuthProvider>();
                   final userId = auth.currentUser?['id'] as int?;
                   if (userId != null) {
@@ -549,9 +647,8 @@ class _SessionScreenState extends State<SessionScreen> {
             const SizedBox(width: 12),
             Expanded(
               child: OutlinedButton.icon(
-                onPressed: () =>
-                    Navigator.pushNamedAndRemoveUntil(
-                        context, '/dashboard', (r) => false),
+                onPressed: () => Navigator.pushNamedAndRemoveUntil(
+                    context, '/dashboard', (r) => false),
                 icon: const Icon(Icons.close_rounded, size: 20),
                 label: const Text("Exit"),
                 style: OutlinedButton.styleFrom(

@@ -191,6 +191,30 @@ class SessionProvider extends ChangeNotifier {
     await _reloadZones();
     notifyListeners();
   }
+  Future<void> addEmptyZone(String zoneName) async {
+    if (_sessionId == null) return;
+    final dbConn = await DatabaseHelper().database;
+
+    // Check if zone with same name already exists
+    final existing = await dbConn.query(
+      'scan_zones',
+      where: "session_id = ? AND LOWER(zone_name) = ?",
+      whereArgs: [_sessionId, zoneName.toLowerCase()],
+      limit: 1,
+    );
+    if (existing.isNotEmpty) return;
+
+    await dbConn.insert('scan_zones', {
+      'session_id':  _sessionId,
+      'zone_name':   zoneName,
+      'status':      'pending',
+      'boxes':       0,
+      'total_boxes': 0,
+    });
+
+    await _reloadZones();
+    notifyListeners();
+  }
 
   // ── Save / complete session ───────────────────────────────────────────────
 
