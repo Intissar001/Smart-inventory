@@ -14,8 +14,8 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   bool isSignIn = true;
   bool showPassword = false;
 
-  final Color bgGrey      = const Color(0xDF939090);
-  final Color brownShadow = const Color(0xE2030303);
+  final Color bgGrey       = const Color(0xDF939090);
+  final Color brownShadow  = const Color(0xE2030303);
   final Color bioBlueFaded = const Color(0xFF5C9DED);
 
   final _formKey = GlobalKey<FormState>();
@@ -37,6 +37,7 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
     final auth = Provider.of<AuthProvider>(context, listen: false);
 
     if (isSignIn) {
+      // ── Sign In ──────────────────────────────────────────────────────────
       final error = await auth.login(
         _emailController.text.trim(),
         _passwordController.text,
@@ -47,7 +48,12 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         );
         return;
       }
+      // Only navigate to dashboard after a successful LOGIN
+      if (mounted) {
+        Navigator.pushReplacementNamed(context, '/dashboard');
+      }
     } else {
+      // ── Register ─────────────────────────────────────────────────────────
       final error = await auth.register(
         _emailController.text.trim(),
         _passwordController.text,
@@ -58,10 +64,22 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         );
         return;
       }
-    }
-
-    if (mounted) {
-      Navigator.pushReplacementNamed(context, '/dashboard');
+      // After successful registration → switch to Sign In and show confirmation
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Account created! Please sign in."),
+            backgroundColor: Color(0xFF10B981),
+          ),
+        );
+        setState(() {
+          isSignIn = true;
+          showPassword = false;
+          _passwordController.clear();
+          _confirmPasswordController.clear();
+          _formKey.currentState?.reset();
+        });
+      }
     }
   }
 
@@ -91,8 +109,11 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    isSignIn ? "Sign in to access your inventory" : "Join to manage your inventory",
-                    style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 16),
+                    isSignIn
+                        ? "Sign in to access your inventory"
+                        : "Join to manage your inventory",
+                    style: TextStyle(
+                        color: Colors.white.withOpacity(0.6), fontSize: 16),
                   ),
                   const SizedBox(height: 32),
                   Form(
@@ -106,7 +127,8 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
                           icon: Icons.mail_outline,
                           controller: _emailController,
                           validator: (value) {
-                            if (value == null || value.isEmpty) return "Please enter your email";
+                            if (value == null || value.isEmpty)
+                              return "Please enter your email";
                             return null;
                           },
                         ),
@@ -118,8 +140,10 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
                           controller: _passwordController,
                           isPassword: true,
                           validator: (value) {
-                            if (value == null || value.isEmpty) return "Please enter your password";
-                            if (value.length < 6) return "Password must be at least 6 characters";
+                            if (value == null || value.isEmpty)
+                              return "Please enter your password";
+                            if (value.length < 6)
+                              return "Password must be at least 6 characters";
                             return null;
                           },
                         ),
@@ -132,7 +156,8 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
                             controller: _confirmPasswordController,
                             isPassword: true,
                             validator: (value) {
-                              if (value != _passwordController.text) return "Passwords do not match";
+                              if (value != _passwordController.text)
+                                return "Passwords do not match";
                               return null;
                             },
                           ),
@@ -159,11 +184,7 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [
-            bgGrey,
-            brownShadow,
-            const Color(0xFF1A1A1A),
-          ],
+          colors: [bgGrey, brownShadow, const Color(0xFF1A1A1A)],
         ),
       ),
       child: BackdropFilter(
@@ -177,20 +198,19 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
     return Container(
       width: 100,
       height: 100,
-      padding: const EdgeInsets.all(0),
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(0.05),
         shape: BoxShape.circle,
         border: Border.all(color: Colors.white.withOpacity(0.1)),
         boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 20, offset: const Offset(0, 10))
+          BoxShadow(
+              color: Colors.black.withOpacity(0.3),
+              blurRadius: 20,
+              offset: const Offset(0, 10))
         ],
       ),
       child: ClipOval(
-        child: Image.asset(
-          'assets/authlogo.png',
-          fit: BoxFit.cover,
-        ),
+        child: Image.asset('assets/authlogo.png', fit: BoxFit.cover),
       ),
     );
   }
@@ -221,25 +241,32 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
       decoration: InputDecoration(
         hintText: hint,
         hintStyle: TextStyle(color: Colors.white.withOpacity(0.2)),
-        prefixIcon: Icon(icon, color: bioBlueFaded.withOpacity(0.7), size: 22),
+        prefixIcon:
+            Icon(icon, color: bioBlueFaded.withOpacity(0.7), size: 22),
         suffixIcon: isPassword
             ? IconButton(
                 icon: Icon(
-                    showPassword ? Icons.visibility : Icons.visibility_off,
+                    showPassword
+                        ? Icons.visibility
+                        : Icons.visibility_off,
                     color: Colors.white.withOpacity(0.3)),
-                onPressed: () => setState(() => showPassword = !showPassword),
+                onPressed: () =>
+                    setState(() => showPassword = !showPassword),
               )
             : null,
         filled: true,
         fillColor: Colors.white.withOpacity(0.05),
-        border:
-            OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+        border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(16),
+            borderSide: BorderSide.none),
         enabledBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide(color: Colors.white.withOpacity(0.05))),
+            borderSide:
+                BorderSide(color: Colors.white.withOpacity(0.05))),
         focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide(color: bioBlueFaded.withOpacity(0.5))),
+            borderSide:
+                BorderSide(color: bioBlueFaded.withOpacity(0.5))),
         errorStyle: const TextStyle(color: Colors.redAccent),
       ),
     );
@@ -252,7 +279,10 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 15, offset: const Offset(0, 5))
+          BoxShadow(
+              color: Colors.black.withOpacity(0.3),
+              blurRadius: 15,
+              offset: const Offset(0, 5))
         ],
       ),
       child: ElevatedButton(
@@ -260,14 +290,20 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         style: ElevatedButton.styleFrom(
           backgroundColor: Colors.white,
           foregroundColor: bgGrey,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           elevation: 0,
         ).copyWith(
           splashFactory: NoSplash.splashFactory,
           overlayColor: WidgetStateProperty.all(Colors.transparent),
         ),
-        child: Text(isSignIn ? "SIGN IN" : "GET STARTED",
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900, letterSpacing: 1.2)),
+        child: Text(
+          isSignIn ? "SIGN IN" : "GET STARTED",
+          style: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 1.2),
+        ),
       ),
     );
   }
@@ -276,7 +312,11 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
     return TextButton(
       onPressed: () => setState(() {
         isSignIn = !isSignIn;
+        showPassword = false;
         _formKey.currentState?.reset();
+        _emailController.clear();
+        _passwordController.clear();
+        _confirmPasswordController.clear();
       }),
       style: ButtonStyle(
         splashFactory: NoSplash.splashFactory,
@@ -284,12 +324,15 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
       ),
       child: RichText(
         text: TextSpan(
-          text: isSignIn ? "Don't have an account? " : "Already have an account? ",
+          text: isSignIn
+              ? "Don't have an account? "
+              : "Already have an account? ",
           style: TextStyle(color: Colors.white.withOpacity(0.5)),
           children: [
             TextSpan(
               text: isSignIn ? "Sign Up" : "Sign In",
-              style: TextStyle(color: bioBlueFaded, fontWeight: FontWeight.bold),
+              style: TextStyle(
+                  color: bioBlueFaded, fontWeight: FontWeight.bold),
             ),
           ],
         ),

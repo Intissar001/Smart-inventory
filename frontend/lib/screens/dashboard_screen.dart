@@ -4,6 +4,8 @@ import 'scanner_screen.dart';
 import 'session_screen.dart';
 import 'catalog_screen.dart';
 import '../providers/settings_provider.dart';
+import '../providers/auth_provider.dart';
+import '../providers/session_provider.dart';
 import 'alerts_screen.dart';
 import 'reports_screen.dart';
 
@@ -17,28 +19,34 @@ class DashboardScreen extends StatefulWidget {
 class _DashboardScreenState extends State<DashboardScreen> {
   int _currentIndex = 0;
 
-  void _onNavigateToSession() {
-    setState(() {
-      _currentIndex = 1;
-    });
+  @override
+  void initState() {
+    super.initState();
+    // Bootstrap session for the logged-in user
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initSession());
   }
 
-  void _onNavigateToAlerts() {
-    setState(() {
-      _currentIndex = 3;
-    });
+  Future<void> _initSession() async {
+    final auth     = context.read<AuthProvider>();
+    final sp       = context.read<SessionProvider>();
+    final userId   = auth.currentUser?['id'] as int?;
+    if (userId != null && sp.sessionId == null) {
+      await sp.loadOrCreateSession(userId);
+    }
   }
+
+  void _onNavigateToSession() => setState(() => _currentIndex = 1);
+  void _onNavigateToAlerts()  => setState(() => _currentIndex = 3);
 
   @override
   Widget build(BuildContext context) {
     final isDark = context.select<SettingsProvider, bool>((p) => p.darkMode);
 
-    final List<Widget> _pages = [
+    final List<Widget> pages = [
       _HomeContent(
           onViewSession: _onNavigateToSession,
-          onViewAlerts: _onNavigateToAlerts,
-          isDark: isDark
-      ),
+          onViewAlerts:  _onNavigateToAlerts,
+          isDark: isDark),
       const SessionScreen(),
       const CatalogScreen(),
       AlertsScreen(),
@@ -47,15 +55,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return Scaffold(
       extendBody: true,
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _pages,
-      ),
+      body: IndexedStack(index: _currentIndex, children: pages),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
       floatingActionButton: _buildFab(isDark),
       bottomNavigationBar: _buildBottomAppBar(isDark),
     );
   }
+
+  // ── FAB — scan from anywhere, result goes to SessionProvider ───────────────
 
   Widget _buildFab(bool isDark) {
     return Container(
@@ -63,7 +70,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       width: 64,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        gradient: const LinearGradient(colors: [Color(0xFF6366F1), Color(0xFFD946EF)]),
+        gradient: const LinearGradient(
+            colors: [Color(0xFF6366F1), Color(0xFFD946EF)]),
         boxShadow: [
           BoxShadow(
               color: const Color(0xFF6366F1).withOpacity(isDark ? 0.6 : 0.4),
@@ -72,14 +80,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ],
       ),
       child: FloatingActionButton(
-        onPressed: () => Navigator.push(
-            context, MaterialPageRoute(builder: (_) => const CameraScanScreen())),
+        onPressed: () => _launchScan(),
         backgroundColor: Colors.transparent,
         elevation: 0,
-        child: const Icon(Icons.camera_alt_outlined, color: Colors.white, size: 28),
+        child: const Icon(Icons.camera_alt_outlined,
+            color: Colors.white, size: 28),
       ),
     );
   }
+
+  Future<void> _launchScan() async {
+    final result = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(builder: (_) => const CameraScanScreen()),
+    );
+    if (result != null && mounted) {
+      // Persist via SessionProvider (shared state)
+      await context.read<SessionProvider>().handleScanResult(result);
+      // Navigate to session tab so the user sees the result immediately
+      setState(() => _currentIndex = 1);
+    }
+  }
+
+  // ── Bottom nav ─────────────────────────────────────────────
 
   Widget _buildBottomAppBar(bool isDark) {
     return BottomAppBar(
@@ -90,27 +113,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
-          Row(
-            children: [
-              _navItem(Icons.home_outlined, "Home", 0, isDark),
-              _navItem(Icons.assignment_outlined, "Session", 1, isDark),
-              _navItem(Icons.medication_outlined, "Catalog", 2, isDark),
-            ],
-          ),
+          Row(children: [
+            _navItem(Icons.home_outlined, "Home", 0, isDark),
+            _navItem(Icons.assignment_outlined, "Session", 1, isDark),
+            _navItem(Icons.medication_outlined, "Catalog", 2, isDark),
+          ]),
           const SizedBox(width: 95),
-          Row(
-            children: [
-              _navItem(Icons.notifications_none_outlined, "Alerts", 3, isDark),
-              _navItem(Icons.bar_chart_outlined, "Report", 4, isDark),
-            ],
-          ),
+          Row(children: [
+            _navItem(Icons.notifications_none_outlined, "Alerts", 3, isDark),
+            _navItem(Icons.bar_chart_outlined, "Report", 4, isDark),
+          ]),
         ],
       ),
     );
   }
 
   Widget _navItem(IconData icon, String label, int index, bool isDark) {
-    bool isSelected = _currentIndex == index;
+    final bool isSelected = _currentIndex == index;
     return InkWell(
       onTap: () => setState(() => _currentIndex = index),
       splashFactory: NoSplash.splashFactory,
@@ -122,13 +141,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon,
-                color: isSelected ? const Color(0xFF6366F1) : const Color(0xFF94A3B8),
+                color: isSelected
+                    ? const Color(0xFF6366F1)
+                    : const Color(0xFF94A3B8),
                 size: 24),
             Text(label,
                 style: TextStyle(
-                  color: isSelected ? const Color(0xFF6366F1) : const Color(0xFF94A3B8),
+                  color: isSelected
+                      ? const Color(0xFF6366F1)
+                      : const Color(0xFF94A3B8),
                   fontSize: 10,
-                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                  fontWeight: isSelected
+                      ? FontWeight.w600
+                      : FontWeight.normal,
                 )),
           ],
         ),
@@ -137,11 +162,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Home content
+// ─────────────────────────────────────────────────────────────────────────────
+
 class _HomeContent extends StatelessWidget {
   final VoidCallback onViewSession;
   final VoidCallback onViewAlerts;
   final bool isDark;
-  const _HomeContent({required this.onViewSession, required this.onViewAlerts, required this.isDark});
+  const _HomeContent({
+    required this.onViewSession,
+    required this.onViewAlerts,
+    required this.isDark,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -174,22 +207,28 @@ class _HomeContent extends StatelessWidget {
                             style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 18,
-                                color: isDark ? Colors.white : Colors.black)),
+                                color: isDark
+                                    ? Colors.white
+                                    : Colors.black)),
                         Text("AI-Powered System",
                             style: TextStyle(
-                                color: isDark ? Colors.grey.shade400 : Colors.grey,
+                                color: isDark
+                                    ? Colors.grey.shade400
+                                    : Colors.grey,
                                 fontSize: 12)),
                       ],
                     ),
                     const Spacer(),
                     _CircleIconButton(
                       icon: Icons.settings_outlined,
-                      onTap: () => Navigator.pushNamed(context, '/settings'),
+                      onTap: () =>
+                          Navigator.pushNamed(context, '/settings'),
                     ),
                     const SizedBox(width: 8),
                     _CircleIconButton(
                       icon: Icons.person_outline,
-                      onTap: () => Navigator.pushNamed(context, '/profile'),
+                      onTap: () =>
+                          Navigator.pushNamed(context, '/profile'),
                     ),
                   ],
                 ),
@@ -201,9 +240,11 @@ class _HomeContent extends StatelessWidget {
                 delegate: SliverChildListDelegate([
                   const _HeroCard(),
                   const SizedBox(height: 16),
-                  _LowStockAlertsCard(isDark: isDark, onViewAll: onViewAlerts),
+                  _LowStockAlertsCard(
+                      isDark: isDark, onViewAll: onViewAlerts),
                   const SizedBox(height: 16),
-                  _RecentScanCard(isDark: isDark, onTap: onViewSession),
+                  _RecentScanCard(
+                      isDark: isDark, onTap: onViewSession),
                   const SizedBox(height: 16),
                   _TipCard(isDark: isDark),
                   const SizedBox(height: 120),
@@ -220,7 +261,8 @@ class _HomeContent extends StatelessWidget {
 class _LowStockAlertsCard extends StatelessWidget {
   final bool isDark;
   final VoidCallback onViewAll;
-  const _LowStockAlertsCard({required this.isDark, required this.onViewAll});
+  const _LowStockAlertsCard(
+      {required this.isDark, required this.onViewAll});
 
   @override
   Widget build(BuildContext context) {
@@ -240,7 +282,8 @@ class _LowStockAlertsCard extends StatelessWidget {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 24),
+                    const Icon(Icons.warning_amber_rounded,
+                        color: Colors.orange, size: 24),
                     const SizedBox(width: 8),
                     Text("Stock Alerts",
                         style: TextStyle(
@@ -253,24 +296,32 @@ class _LowStockAlertsCard extends StatelessWidget {
                   onPressed: onViewAll,
                   child: const Row(
                     children: [
-                      Text("View All", style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
-                      Icon(Icons.arrow_forward, color: Colors.orange, size: 16),
+                      Text("View All",
+                          style: TextStyle(
+                              color: Colors.orange,
+                              fontWeight: FontWeight.bold)),
+                      Icon(Icons.arrow_forward,
+                          color: Colors.orange, size: 16),
                     ],
                   ),
                 )
               ],
             ),
             const SizedBox(height: 10),
-            _alertItem("Paracetamol 500mg", 12, 50, "Urgent", Colors.orange),
-            _alertItem("Amoxicillin 250mg", 8, 30, "Critical", Colors.red),
-            _alertItem("Ibuprofen 400mg", 15, 40, "Urgent", Colors.orange),
+            _alertItem(
+                "Paracetamol 500mg", 12, 50, "Urgent", Colors.orange),
+            _alertItem(
+                "Amoxicillin 250mg", 8, 30, "Critical", Colors.red),
+            _alertItem(
+                "Ibuprofen 400mg", 15, 40, "Urgent", Colors.orange),
           ],
         ),
       ),
     );
   }
 
-  Widget _alertItem(String name, int current, int minStock, String status, Color color) {
+  Widget _alertItem(String name, int current, int minStock,
+      String status, Color color) {
     double progress = current / minStock;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12.0),
@@ -280,14 +331,22 @@ class _LowStockAlertsCard extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(name, style: TextStyle(fontSize: 14, color: isDark ? Colors.white : Colors.black)),
+              Text(name,
+                  style: TextStyle(
+                      fontSize: 14,
+                      color: isDark ? Colors.white : Colors.black)),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
                   color: color.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Text(status, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold)),
+                child: Text(status,
+                    style: TextStyle(
+                        color: color,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold)),
               ),
             ],
           ),
@@ -300,13 +359,17 @@ class _LowStockAlertsCard extends StatelessWidget {
                   child: LinearProgressIndicator(
                     value: progress.clamp(0.0, 1.0),
                     minHeight: 8,
-                    backgroundColor: isDark ? Colors.white10 : Colors.grey.shade100,
+                    backgroundColor: isDark
+                        ? Colors.white10
+                        : Colors.grey.shade100,
                     valueColor: AlwaysStoppedAnimation<Color>(color),
                   ),
                 ),
               ),
               const SizedBox(width: 12),
-              Text("$current/$minStock", style: const TextStyle(color: Colors.grey, fontSize: 12)),
+              Text("$current/$minStock",
+                  style:
+                      const TextStyle(color: Colors.grey, fontSize: 12)),
             ],
           ),
         ],
@@ -322,6 +385,13 @@ class _RecentScanCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Pull live totals from SessionProvider
+    final sp = context.watch<SessionProvider>();
+    final totalBoxes = sp.totalBoxes;
+    final lastZone = sp.zones.isNotEmpty ? sp.zones.last : null;
+    final timeStr  = lastZone?.time ?? '--';
+    final boxStr   = totalBoxes > 0 ? '$totalBoxes boxes counted' : 'No scans yet';
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -329,7 +399,9 @@ class _RecentScanCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-              color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 4))
+              color: Colors.black.withOpacity(0.03),
+              blurRadius: 10,
+              offset: const Offset(0, 4))
         ],
       ),
       child: Column(
@@ -343,14 +415,23 @@ class _RecentScanCard extends StatelessWidget {
                       fontSize: 16,
                       color: isDark ? Colors.white : Colors.black)),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 4),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFDCFCE7),
+                  color: lastZone != null
+                      ? const Color(0xFFDCFCE7)
+                      : Colors.grey.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(20),
                 ),
-                child: const Text("Completed",
-                    style: TextStyle(
-                        color: Color(0xFF16A34A), fontSize: 12, fontWeight: FontWeight.bold)),
+                child: Text(
+                  lastZone != null ? "Completed" : "No scan",
+                  style: TextStyle(
+                      color: lastZone != null
+                          ? const Color(0xFF16A34A)
+                          : Colors.grey,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold),
+                ),
               ),
             ],
           ),
@@ -363,23 +444,30 @@ class _RecentScanCard extends StatelessWidget {
                   color: const Color(0xFF3B82F6),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(Icons.medication_outlined, color: Colors.white),
+                child: const Icon(Icons.medication_outlined,
+                    color: Colors.white),
               ),
               const SizedBox(width: 16),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text("302 boxes counted",
+                  Text(boxStr,
                       style: TextStyle(
                           fontWeight: FontWeight.bold,
                           fontSize: 17,
                           color: isDark ? Colors.white : Colors.black)),
                   const SizedBox(height: 4),
-                  const Row(
+                  Row(
                     children: [
-                      Icon(Icons.access_time, size: 14, color: Colors.grey),
-                      SizedBox(width: 4),
-                      Text("Today at 09:30 AM", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                      const Icon(Icons.access_time,
+                          size: 14, color: Colors.grey),
+                      const SizedBox(width: 4),
+                      Text(
+                          lastZone != null
+                              ? 'Last zone at $timeStr'
+                              : 'Tap to start scanning',
+                          style: const TextStyle(
+                              color: Colors.grey, fontSize: 12)),
                     ],
                   ),
                 ],
@@ -389,13 +477,17 @@ class _RecentScanCard extends StatelessWidget {
                 onTap: onTap,
                 borderRadius: BorderRadius.circular(10),
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 8),
                   decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF3B82F6)),
+                    border: Border.all(
+                        color: const Color(0xFF3B82F6)),
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: const Text("View",
-                      style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3B82F6))),
+                      style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF3B82F6))),
                 ),
               ),
             ],
@@ -413,7 +505,8 @@ class _DashboardLogo extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(colors: [Color(0xFF6366F1), Color(0xFFA855F7)]),
+        gradient: const LinearGradient(
+            colors: [Color(0xFF6366F1), Color(0xFFA855F7)]),
         borderRadius: BorderRadius.circular(12),
       ),
       child: const Icon(Icons.auto_awesome, color: Colors.white, size: 24),
@@ -425,38 +518,62 @@ class _HeroCard extends StatelessWidget {
   const _HeroCard();
   @override
   Widget build(BuildContext context) {
+    // Tapping HeroCard launches the global FAB scan
     return GestureDetector(
-      onTap: () => Navigator.push(
-          context, MaterialPageRoute(builder: (context) => const CameraScanScreen())),
+      onTap: () async {
+        final result = await Navigator.push<Map<String, dynamic>>(
+            context,
+            MaterialPageRoute(
+                builder: (_) => const CameraScanScreen()));
+        if (result != null && context.mounted) {
+          await context.read<SessionProvider>().handleScanResult(result);
+          // Navigate to session tab (index 1)
+          // Find DashboardScreen ancestor and switch tab
+          Navigator.pushNamedAndRemoveUntil(
+              context, '/dashboard', (r) => false);
+        }
+      },
       child: Container(
         height: 150,
         padding: const EdgeInsets.all(24),
         decoration: BoxDecoration(
-          gradient: const LinearGradient(colors: [Color(0xFF6366F1), Color(0xFFD946EF)]),
+          gradient: const LinearGradient(
+              colors: [Color(0xFF6366F1), Color(0xFFD946EF)]),
           borderRadius: BorderRadius.circular(24),
         ),
         child: Stack(children: [
           const Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Row(children: [
-                  Icon(Icons.bolt, color: Colors.white, size: 16),
-                  SizedBox(width: 4),
-                  Text("Quick Action", style: TextStyle(color: Colors.white70))
-                ]),
-                SizedBox(height: 8),
-                Text("Start Scanning",
-                    style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
-                Text("Count medicines with AI", style: TextStyle(color: Colors.white70)),
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Row(children: [
+                Icon(Icons.bolt, color: Colors.white, size: 16),
+                SizedBox(width: 4),
+                Text("Quick Action",
+                    style: TextStyle(color: Colors.white70)),
               ]),
+              SizedBox(height: 8),
+              Text("Start Scanning",
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 26,
+                      fontWeight: FontWeight.bold)),
+              Text("Count medicines with AI",
+                  style: TextStyle(color: Colors.white70)),
+            ],
+          ),
           Positioned(
-              right: 0,
-              bottom: 0,
-              child: Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(16)),
-                  child: const Icon(Icons.camera_alt_outlined, color: Colors.white, size: 36))),
+            right: 0,
+            bottom: 0,
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(16)),
+              child: const Icon(Icons.camera_alt_outlined,
+                  color: Colors.white, size: 36),
+            ),
+          ),
         ]),
       ),
     );
@@ -473,7 +590,8 @@ class _TipCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: const Color(0xFFFFFBEB),
         borderRadius: BorderRadius.circular(24),
-        border: Border(left: BorderSide(color: Colors.amber.shade600, width: 4)),
+        border: Border(
+            left: BorderSide(color: Colors.amber.shade600, width: 4)),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -484,7 +602,8 @@ class _TipCard extends StatelessWidget {
               color: const Color(0xFFF59E0B),
               borderRadius: BorderRadius.circular(12),
             ),
-            child: const Icon(Icons.auto_awesome, color: Colors.white, size: 20),
+            child: const Icon(Icons.auto_awesome,
+                color: Colors.white, size: 20),
           ),
           const SizedBox(width: 16),
           const Expanded(
@@ -495,13 +614,18 @@ class _TipCard extends StatelessWidget {
                   children: [
                     Text("💡", style: TextStyle(fontSize: 14)),
                     SizedBox(width: 6),
-                    Text("Quick Tip", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                    Text("Quick Tip",
+                        style: TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 15)),
                   ],
                 ),
                 SizedBox(height: 4),
                 Text(
                   "Hold your phone steady for 2 seconds for best AI detection results!",
-                  style: TextStyle(color: Color(0xFF92400E), fontSize: 13, height: 1.4),
+                  style: TextStyle(
+                      color: Color(0xFF92400E),
+                      fontSize: 13,
+                      height: 1.4),
                 ),
               ],
             ),
@@ -519,13 +643,17 @@ class _CircleIconButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = context.select<SettingsProvider, bool>((p) => p.darkMode);
-
+    final isDark =
+        context.select<SettingsProvider, bool>((p) => p.darkMode);
     return IconButton(
       onPressed: onTap,
-      icon: Icon(icon, size: 22, color: isDark ? Colors.white : Colors.black),
+      icon: Icon(icon,
+          size: 22,
+          color: isDark ? Colors.white : Colors.black),
       style: IconButton.styleFrom(
-          backgroundColor: isDark ? Colors.white.withOpacity(0.1) : Colors.white.withOpacity(0.5),
+          backgroundColor: isDark
+              ? Colors.white.withOpacity(0.1)
+              : Colors.white.withOpacity(0.5),
           shape: const CircleBorder()),
     );
   }

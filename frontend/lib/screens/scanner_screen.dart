@@ -185,20 +185,21 @@ class _CameraScanScreenState extends State<CameraScanScreen>
       }).toList();
 
       if (mounted) {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => AnnotationEditorScreen(
-              capturedImage: uiImage,
-              imageFile: file,
-              detectedBoxes: boxes,
-              imageWidth: imgW,
-              imageHeight: imgH,
-              backendBase: _backendUrl.replaceAll('/detect', ''),
-            ),
-          ),
-        );
-      }
+              final result = await Navigator.push<Map<String, dynamic>>(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => AnnotationEditorScreen(
+                    capturedImage: uiImage,
+                    imageFile: file,
+                    detectedBoxes: boxes,
+                    imageWidth: imgW,
+                    imageHeight: imgH,
+                    backendBase: _backendUrl.replaceAll('/detect', ''),
+                  ),
+                ),
+              );
+              if (mounted && result != null) Navigator.pop(context, result);
+            }
     } catch (e) {
       debugPrint("Capture error: $e");
       _showError("Impossible de contacter le backend.\nVérifie l'IP.");
@@ -715,22 +716,23 @@ class _AnnotationEditorScreenState extends State<AnnotationEditorScreen> {
   }
 
   Future<void> _confirmAndSave() async {
-    // Navigate to results screen
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ScanResultsScreen(
-          detectedBoxes: _boxes,
-          capturedImage: widget.capturedImage,
-          imageFile: widget.imageFile,
-          imageWidth: widget.imageWidth,
-          imageHeight: widget.imageHeight,
-          backendBase: widget.backendBase,
+      if (!mounted) return;
+      final result = await Navigator.push<Map<String, dynamic>>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ScanResultsScreen(
+            detectedBoxes: _boxes,
+            capturedImage: widget.capturedImage,
+            imageFile: widget.imageFile,
+            imageWidth: widget.imageWidth,
+            imageHeight: widget.imageHeight,
+            backendBase: widget.backendBase,
+          ),
         ),
-      ),
-    );
-  }
+      );
+      if (!mounted) return;
+      if (result != null) Navigator.pop(context, result);
+    }
 
   // ── Build ─────────────────────────────────────────────────────────────────
 
@@ -1406,12 +1408,59 @@ class _ScanResultsScreenState extends State<ScanResultsScreen>
     });
   }
 
-  void _confirmSave() {
-    setState(() => _showSuccess = true);
-    _successAnim.forward();
-    Future.delayed(
-        const Duration(milliseconds: 2500), () => Navigator.pop(context));
-  }
+  Future<void> _confirmSave() async {
+      final zoneCtrl = TextEditingController(text: _shelfName);
+      final zoneName = await showDialog<String>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text("Zone name"),
+          content: TextField(
+            controller: zoneCtrl,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: "Zone / shelf name",
+              hintText: "e.g. Shelf A, Zone 3…",
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, zoneCtrl.text.trim()),
+              child: const Text("Confirm"),
+            ),
+          ],
+        ),
+      );
+
+      if (zoneName == null || !mounted) return;
+
+      // Build a rich list: one entry per display-group (name+dosage+form+count)
+      final groups = _groups;
+      final List<Map<String, dynamic>> richMeds = groups
+          .where((g) => g.name.trim().isNotEmpty)
+          .map((g) => <String, dynamic>{
+                'name':   g.name.trim(),
+                'dosage': g.dosage.trim(),
+                'form':   g.form.trim(),
+                'count':  g.totalCount,
+              })
+          .toList();
+
+      setState(() => _showSuccess = true);
+      _successAnim.forward();
+
+      await Future.delayed(const Duration(milliseconds: 2500));
+      if (!mounted) return;
+
+      Navigator.pop(context, <String, dynamic>{
+        'zoneName': zoneName.isEmpty ? 'Zone' : zoneName,
+        'count': _grandTotal,
+        'meds': richMeds, // List<Map> with name/dosage/form/count
+      });
+    }
 
   // ── Build ─────────────────────────────────────────────────────────────────
 

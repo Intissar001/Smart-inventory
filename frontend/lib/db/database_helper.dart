@@ -1,6 +1,8 @@
 // lib/db/database_helper.dart
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+// ignore: depend_on_referenced_packages
+import '../providers/session_provider.dart'; // for ZoneMedEntry
 
 class DatabaseHelper {
   // ── Singleton ──────────────────────────────────────────────
@@ -12,7 +14,7 @@ class DatabaseHelper {
   static Database? _db;
 
   static const String _dbName    = 'smart_inventory.db';
-  static const int    _dbVersion = 3;
+  static const int    _dbVersion = 4; // bumped: zone_medicines gains dosage/form/count
 
   // ── Accès à la base ────────────────────────────────────────
   Future<Database> get database async {
@@ -108,11 +110,15 @@ class DatabaseHelper {
       ''');
       await txn.execute('CREATE INDEX idx_zones_session ON scan_zones(session_id)');
 
+      // ── zone_medicines v2: stores full med info ──────────────
       await txn.execute('''
         CREATE TABLE zone_medicines (
           id        INTEGER PRIMARY KEY AUTOINCREMENT,
           zone_id   INTEGER NOT NULL,
           name      TEXT    NOT NULL,
+          dosage    TEXT    NOT NULL DEFAULT '',
+          form      TEXT    NOT NULL DEFAULT '',
+          count     INTEGER NOT NULL DEFAULT 1,
           FOREIGN KEY (zone_id) REFERENCES scan_zones(id) ON DELETE CASCADE
         )
       ''');
@@ -160,7 +166,7 @@ class DatabaseHelper {
           quantity_after   INTEGER NOT NULL DEFAULT 0,
           reason           TEXT,
           moved_at         TEXT    NOT NULL DEFAULT (datetime('now')),
-          FOREIGN KEY (medicine_id) REFERENCES medicines(id) ON DELETE CASCADE,
+          FOREIGN KEY (medicine_id) REFERENCES inventory_sessions(id) ON DELETE CASCADE,
           FOREIGN KEY (session_id)  REFERENCES inventory_sessions(id) ON DELETE SET NULL
         )
       ''');
@@ -185,7 +191,15 @@ class DatabaseHelper {
 
   // ── Migrations ────────────────────────────────────────────
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
-    // v2 → v3 : crée les tables zone_medicines et alerts manquantes
+    // v3 → v4: add dosage/form/count columns to zone_medicines
+    if (oldVersion < 4) {
+      await db.transaction((txn) async {
+        try { await txn.execute("ALTER TABLE zone_medicines ADD COLUMN dosage TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+        try { await txn.execute("ALTER TABLE zone_medicines ADD COLUMN form   TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+        try { await txn.execute("ALTER TABLE zone_medicines ADD COLUMN count  INTEGER NOT NULL DEFAULT 1"); } catch (_) {}
+      });
+    }
+
     if (oldVersion < 3) {
       await db.transaction((txn) async {
         await txn.execute('''
@@ -193,6 +207,9 @@ class DatabaseHelper {
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
             zone_id INTEGER NOT NULL,
             name    TEXT    NOT NULL,
+            dosage  TEXT    NOT NULL DEFAULT '',
+            form    TEXT    NOT NULL DEFAULT '',
+            count   INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (zone_id) REFERENCES scan_zones(id) ON DELETE CASCADE
           )
         ''');
@@ -234,13 +251,14 @@ class DatabaseHelper {
         await txn.update('inventory_sessions', {'user_id': userId}, where: 'user_id IS NULL');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_medicines_user ON medicines(user_id)');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user ON inventory_sessions(user_id)');
-
-        // Crée les nouvelles tables si elles n'existent pas encore
         await txn.execute('''
           CREATE TABLE IF NOT EXISTS zone_medicines (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
             zone_id INTEGER NOT NULL,
             name    TEXT    NOT NULL,
+            dosage  TEXT    NOT NULL DEFAULT '',
+            form    TEXT    NOT NULL DEFAULT '',
+            count   INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (zone_id) REFERENCES scan_zones(id) ON DELETE CASCADE
           )
         ''');
@@ -249,7 +267,7 @@ class DatabaseHelper {
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             medicine_id INTEGER NOT NULL,
             is_read     INTEGER NOT NULL DEFAULT 0,
-            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            created_at  TEXT    NOT NULL DEFAULT (datetime(\'now\')),
             FOREIGN KEY (medicine_id) REFERENCES medicines(id) ON DELETE CASCADE
           )
         ''');
@@ -258,112 +276,118 @@ class DatabaseHelper {
   }
 
   // ════════════════════════════════════════════════════════════
+  // ZONE_MEDICINES — rich API
+  // ════════════════════════════════════════════════════════════
+
+  /// Returns rich med entries for a zone (name + dosage + form + count)
+  Future<List<Map<String, dynamic>>> getMedicinesRichForZone(int zoneId) async {
+    final db = await database;
+    final rows = await db.query(
+      'zone_medicines',
+      where:     'zone_id = ?',
+      whereArgs: [zoneId],
+      orderBy:   'id ASC',
+    );
+    return rows
+        .map((r) => {
+              'id':     r['id'],
+              'name':   r['name']   as String? ?? '',
+              'dosage': r['dosage'] as String? ?? '',
+              'form':   r['form']   as String? ?? '',
+              'count':  r['count']  as int?    ?? 1,
+            })
+        .toList();
+  }
+
+  /// Legacy: name-only list (still used by session_repository)
+  Future<List<String>> getMedicinesForZone(int zoneId) async {
+    final rows = await getMedicinesRichForZone(zoneId);
+    return rows.map((r) => r['name'] as String).toList();
+  }
+
+  /// Delete all meds for a zone before re-inserting
+  Future<void> deleteZoneMedicines(int zoneId) async {
+    final db = await database;
+    await db.delete('zone_medicines', where: 'zone_id = ?', whereArgs: [zoneId]);
+  }
+
+  /// Insert a rich med entry
+  Future<void> insertZoneMedicineRich(int zoneId, ZoneMedEntry entry) async {
+    final db = await database;
+    await db.insert('zone_medicines', {
+      'zone_id': zoneId,
+      'name':    entry.name.trim(),
+      'dosage':  entry.dosage.trim(),
+      'form':    entry.form.trim(),
+      'count':   entry.count,
+    });
+  }
+
+  /// Legacy: name-only insert (kept for backward compat)
+  Future<void> insertZoneMedicine(int zoneId, String medicineName) async {
+    final db = await database;
+    await db.insert('zone_medicines', {
+      'zone_id': zoneId,
+      'name':    medicineName.trim(),
+      'dosage':  '',
+      'form':    '',
+      'count':   1,
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════
   // MÉTHODES SESSIONS
   // ════════════════════════════════════════════════════════════
 
-  /// Retourne la session active (status='active'), ou null
   Future<Map<String, dynamic>?> getActiveSession() async {
     final db = await database;
     final rows = await db.query(
       'inventory_sessions',
-      where: 'status = ?',
+      where:     'status = ?',
       whereArgs: ['active'],
-      orderBy: 'started_at DESC',
-      limit: 1,
+      orderBy:   'started_at DESC',
+      limit:     1,
     );
     return rows.isEmpty ? null : rows.first;
   }
 
-  /// Crée une nouvelle session et retourne son id
   Future<int> createSession(Map<String, dynamic> data) async {
     final db = await database;
     return db.insert('inventory_sessions', data);
   }
 
-  /// Met à jour une session existante
   Future<void> updateSession(int sessionId, Map<String, dynamic> data) async {
     final db = await database;
-    await db.update(
-      'inventory_sessions',
-      data,
-      where: 'id = ?',
-      whereArgs: [sessionId],
-    );
+    await db.update('inventory_sessions', data,
+        where: 'id = ?', whereArgs: [sessionId]);
   }
 
   // ════════════════════════════════════════════════════════════
   // MÉTHODES ZONES
   // ════════════════════════════════════════════════════════════
 
-  /// Retourne toutes les zones d'une session
   Future<List<Map<String, dynamic>>> getZonesForSession(int sessionId) async {
     final db = await database;
-    return db.query(
-      'scan_zones',
-      where: 'session_id = ?',
-      whereArgs: [sessionId],
-      orderBy: 'id ASC',
-    );
+    return db.query('scan_zones',
+        where: 'session_id = ?', whereArgs: [sessionId], orderBy: 'id ASC');
   }
 
-  /// Insère une zone et retourne son id
   Future<int> insertZone(Map<String, dynamic> data) async {
     final db = await database;
     return db.insert('scan_zones', data);
   }
 
-  /// Met à jour une zone
   Future<void> updateZone(int zoneId, Map<String, dynamic> data) async {
     final db = await database;
-    await db.update(
-      'scan_zones',
-      data,
-      where: 'id = ?',
-      whereArgs: [zoneId],
-    );
+    await db.update('scan_zones', data, where: 'id = ?', whereArgs: [zoneId]);
   }
 
   // ════════════════════════════════════════════════════════════
-  // MÉTHODES ZONE_MEDICINES (médicaments simples par zone)
+  // ALERTES
   // ════════════════════════════════════════════════════════════
 
-  /// Retourne les noms de médicaments d'une zone
-  Future<List<String>> getMedicinesForZone(int zoneId) async {
-    final db = await database;
-    final rows = await db.query(
-      'zone_medicines',
-      where: 'zone_id = ?',
-      whereArgs: [zoneId],
-    );
-    return rows.map((r) => r['name'] as String).toList();
-  }
-
-  /// Supprime tous les médicaments d'une zone (avant réinsertion)
-  Future<void> deleteZoneMedicines(int zoneId) async {
-    final db = await database;
-    await db.delete(
-      'zone_medicines',
-      where: 'zone_id = ?',
-      whereArgs: [zoneId],
-    );
-  }
-
-  /// Insère un médicament dans une zone
-  Future<void> insertZoneMedicine(int zoneId, String medicineName) async {
-    final db = await database;
-    await db.insert('zone_medicines', {'zone_id': zoneId, 'name': medicineName});
-  }
-
-  // ════════════════════════════════════════════════════════════
-  // MÉTHODES ALERTES
-  // ════════════════════════════════════════════════════════════
-
-  /// Retourne toutes les alertes (médicaments sous stock minimum)
-  /// en joignant la vue v_low_stock avec la table alerts
   Future<List<Map<String, dynamic>>> getAlerts() async {
     final db = await database;
-    // On lit directement depuis la vue v_low_stock
-    // et on joint les alertes existantes pour le flag is_read
     final rows = await db.rawQuery('''
       SELECT
         m.id            AS id,
@@ -387,17 +411,14 @@ class DatabaseHelper {
     return rows;
   }
 
-  /// Recrée les alertes depuis l'état actuel du stock
   Future<void> refreshAlerts() async {
     final db = await database;
-    // Supprime les alertes pour les médicaments qui ne sont plus en rupture
     await db.rawDelete('''
       DELETE FROM alerts
       WHERE medicine_id IN (
         SELECT id FROM medicines WHERE stock >= min_stock
       )
     ''');
-    // Insère les alertes manquantes pour les médicaments en rupture
     await db.rawInsert('''
       INSERT OR IGNORE INTO alerts (medicine_id)
       SELECT id FROM medicines
@@ -406,14 +427,13 @@ class DatabaseHelper {
     ''');
   }
 
-  /// Marque toutes les alertes comme lues
   Future<void> markAllAlertsRead() async {
     final db = await database;
     await db.update('alerts', {'is_read': 1});
   }
 
   // ════════════════════════════════════════════════════════════
-  // MÉTHODES USERS
+  // UTILS
   // ════════════════════════════════════════════════════════════
 
   Future<void> close() async {
