@@ -95,7 +95,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   late AnimationController _pulseController;
 
-  static const String _backendUrl = "http://192.168.1.4:8000/detect";
+  static const String _backendUrl = "http://100.77.152.178:8000/detect";
 
   @override
   void initState() {
