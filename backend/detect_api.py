@@ -278,4 +278,6 @@ if __name__ == "__main__":
     print("   POST /crop        → crop d'une seule boîte (multipart: file + bbox JSON)")
     print("   POST /crop_all    → détection + tous les crops en base64")
     print("📱 Android emulator: http://10.0.2.2:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
